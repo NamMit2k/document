@@ -1,0 +1,124 @@
+======================================================================
+WIKI: QUY TRÌNH DEPLOY .NET 8 BẰNG DOCKER & NGINX (ROCKY LINUX)
+======================================================================
+
+I. QUY TRÌNH DEPLOY HÀNG NGÀY
+--------------------------------------------------
+Bước 1: Tại máy Windows (VS Code / PowerShell)
+   - Build Image:  docker build -t namq/appdemo:latest .
+   - Push Image:   docker push namq/appdemo:latest
+
+Bước 2: Tại Server Rocky Linux (SSH)
+   - Pull Image:   sudo docker pull namq/appdemo:latest
+   - Xóa cũ:       sudo docker rm -f appdemo-container
+   - Chạy mới:     sudo docker run -d --name appdemo-container -p 5050:8080 namq/appdemo:latest
+
+Bước 3: Nginx (Nếu đổi cổng)
+   - Sửa file:     /etc/nginx/conf.d/multi-app.conf (trỏ proxy_pass về cổng mới)
+    VD: đổi sang port 5050 cho khớp với docker
+   # API 1 chạy cổng 8089
+server {
+    listen 8077;
+    server_name 192.168.1.151;
+
+    location / {
+        proxy_pass http://127.0.0.1:5050/; # Trỏ vào port của API 1
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# API 2 chạy cổng 8090 (ví dụ thế)
+server {
+    listen 8078;
+    server_name 192.168.1.151;
+
+    location / {
+        proxy_pass http://127.0.0.1:5001/; # Trỏ vào port của API 2
+        proxy_set_header Host $host;
+        # ... các config khác
+    }
+}
+   - Reload:       sudo systemctl restart nginx
+
+
+II. CÁC LỆNH KIỂM TRA LỖI (TROUBLESHOOTING)
+--------------------------------------------------
+1. Kiểm tra app có đang chạy không:
+   sudo docker ps
+
+2. Xem LOG LỖI (Khi app bị sập hoặc lỗi 500):
+   sudo docker logs appdemo-container
+
+3. Xem tất cả container (kể cả đã tắt):
+   sudo docker ps -a
+
+4. Kiểm tra các Image đang có trên máy:
+   sudo docker images
+
+5. Kiểm tra tài nguyên (CPU/RAM):
+   sudo docker stats
+
+
+III. LỆNH DỌN DẸP SERVER
+--------------------------------------------------
+1. Xóa các image "rác" (không có tên):
+   sudo docker image prune -f
+
+2. Dọn dẹp tổng thể (Xóa sạch container/image không dùng):
+   sudo docker system prune -a
+
+
+IV. LƯU Ý QUAN TRỌNG
+--------------------------------------------------
+1. Cổng nội bộ .NET 8: Luôn là 8080 (trong Docker).
+2. Lỗi Quyền (SELinux): Nếu Nginx không gọi được vào Docker, chạy lệnh:
+   sudo setsebool -P httpd_can_network_connect 1
+3. Mở Port Firewall:
+   sudo firewall-cmd --permanent --add-port=8077/tcp
+   sudo firewall-cmd --reload
+4. Đăng nhập Docker Hub: Dùng Personal Access Token thay cho mật khẩu Google.
+
+V. HƯỚNG DẪN CÀI ĐẶT DOCKER (CHO SERVER MỚI)
+--------------------------------------------------
+1. Thêm Repo Docker:
+   sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+
+2. Cài đặt Docker & Tools:
+   sudo dnf install docker-ce docker-ce-cli containerd.io policycoreutils-python-utils -y
+
+3. Kích hoạt Docker:
+   sudo systemctl start docker
+   sudo systemctl enable docker
+
+4. Cấp quyền Port lạ (SELinux) cho Nginx (Cần thì cài sau):
+   sudo semanage port -a -t http_port_t -p tcp <PORT_CỦA_BẠN>
+
+VI. MẪU DOCKERFILE CHO .NET 8 (Tạo file tên 'Dockerfile' tại thư mục project)
+--- Cài docker support
+Chuột phải vào Tên Project trong Solution Explorer.
+Chọn Add -> Docker Support.
+Chọn Linux khi nó hỏi hệ điều hành. 
+=> Visual Studio sẽ tự sinh ra file Dockerfile và file .dockerignore cho bạn một cách hoàn hảo.
+
+--------------------------------------------------
+FROM mcr.microsoft.com/dotnet/aspnet:8.0 AS base
+WORKDIR /app
+EXPOSE 8080
+
+FROM mcr.microsoft.com/dotnet/sdk:8.0 AS build
+WORKDIR /src
+COPY ["Api1.csproj", "."]
+RUN dotnet restore "Api1.csproj"
+COPY . .
+RUN dotnet build "Api1.csproj" -c Release -o /app/build
+
+FROM build AS publish
+RUN dotnet publish "Api1.csproj" -c Release -o /app/publish
+
+FROM base AS final
+WORKDIR /app
+COPY --from=publish /app/publish .
+ENTRYPOINT ["dotnet", "Api1.dll"]

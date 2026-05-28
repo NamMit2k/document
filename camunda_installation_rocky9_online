@@ -1,0 +1,227 @@
+# Hướng Dẫn Cài Đặt Camunda Tomcat + Oracle Database Bằng Docker Trên Rocky Linux 9
+
+> Tài liệu này đã được tổng hợp và chỉnh sửa dựa trên toàn bộ kinh nghiệm triển khai thực tế, bao gồm các lỗi thường gặp và cách phòng tránh.
+
+---
+
+## 1. Yêu Cầu Chuẩn Bị
+
+### 1.1. Phần Cứng Server Rocky Linux 9
+
+| Thành phần | Yêu cầu tối thiểu | Khuyến nghị |
+| :--- | :--- | :--- |
+| **CPU** | 1 Core | 2 Cores |
+| **RAM** | 2 GB | 4 GB trở lên |
+| **Ổ cứng** | 10 GB SSD | 20 GB SSD |
+
+### 1.2. Thông Tin Kết Nối Oracle Database (Chuẩn bị trước)
+
+Bạn cần có sẵn các thông tin sau từ đội DBA hoặc hệ thống Oracle của ngân hàng:
+
+| Thông tin | Ví dụ |
+| :--- | :--- |
+| **IP Oracle Server** | `192.168.1.127` |
+| **Port** | `1521` |
+| **Service Name** | `XEPDB1` |
+| **Username** | `DOCKER_CAMUNDA` |
+| **Password** | `admin123` |
+
+> [!IMPORTANT]
+> User Oracle phải có quyền **DDL (CREATE TABLE, CREATE SEQUENCE, CREATE INDEX)** để Camunda tự động tạo khoảng 40 bảng hệ thống trong lần khởi động đầu tiên. Sau khi tạo bảng xong, có thể thu hồi quyền DDL và chỉ giữ quyền DML (SELECT, INSERT, UPDATE, DELETE).
+
+### 1.3. File Oracle JDBC Driver
+
+Tải file `ojdbc8.jar` (hoặc `ojdbc11.jar`) từ một trong các nguồn sau:
+- Trang chủ Oracle: [Oracle JDBC Downloads](https://www.oracle.com/database/technologies/appdev/jdbc-downloads.html)
+- Kho Maven Central (Không cần đăng nhập): Tải trực tiếp bằng lệnh `curl`
+- Kho quản lý thư viện nội bộ của ngân hàng (Nexus, Artifactory)
+
+---
+
+## 2. Cài Đặt Docker Trên Rocky Linux 9
+
+### 2.1. Gỡ Podman (Tránh xung đột)
+Rocky Linux 9 cài sẵn Podman thay cho Docker. Gỡ bỏ để tránh xung đột lệnh:
+```bash
+sudo dnf remove -y podman buildah
+```
+
+### 2.2. Thêm Repository Docker Chính Thức
+```bash
+sudo dnf install -y dnf-plugins-core
+sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+```
+
+### 2.3. Cài Đặt Docker Engine
+```bash
+sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+### 2.4. Kích Hoạt Docker
+```bash
+sudo systemctl enable --now docker
+sudo systemctl status docker --no-pager
+```
+
+### 2.5. Cấp Quyền Docker Cho User (Không cần gõ sudo)
+```bash
+sudo usermod -aG docker $USER
+newgrp docker
+```
+
+---
+
+## 3. Cấu Hình Tường Lửa
+
+Mở cổng 8080 để truy cập giao diện Camunda từ máy trạm:
+```bash
+sudo firewall-cmd --permanent --add-port=8080/tcp
+sudo firewall-cmd --reload
+```
+
+---
+
+## 4. Triển Khai Camunda Tomcat Kết Nối Oracle
+
+### 4.1. Tạo Cấu Trúc Thư Mục
+```bash
+mkdir -p ~/camunda-tomcat/lib
+cd ~/camunda-tomcat
+```
+
+### 4.2. Tải Oracle JDBC Driver
+```bash
+# Tải từ Maven Central (không cần đăng nhập Oracle)
+curl -L -o ./lib/ojdbc8.jar \
+  "https://repo1.maven.org/maven2/com/oracle/database/jdbc/ojdbc8/21.9.0.0/ojdbc8-21.9.0.0.jar"
+
+# Xác minh file đã tải thành công (phải hiện ra là file, KHÔNG PHẢI thư mục)
+ls -l ./lib/ojdbc8.jar
+# Kết quả đúng:  -rw-r--r--. 1 root root 4xxxx  ojdbc8.jar  (có dấu "-" ở đầu)
+# Kết quả SAI:   drwxr-xr-x. 2 root root    6   ojdbc8.jar  (có chữ "d" ở đầu = thư mục)
+```
+
+> [!CAUTION]
+> **BẪY CỰC KỲ NGUY HIỂM:** Nếu bạn chạy lệnh `docker compose up` **TRƯỚC KHI** copy file `ojdbc8.jar` vào thư mục `./lib/`, Docker sẽ tự động tạo ra một **thư mục rỗng** tên là `ojdbc8.jar` thay vì file thực. Tomcat sẽ không tìm thấy driver và báo lỗi `ClassNotFoundException`.
+>
+> **Quy tắc vàng:** Luôn chuẩn bị đầy đủ file driver TRƯỚC, rồi mới chạy `docker compose up`.
+>
+> **Nếu đã lỡ chạy trước:** Chạy `docker compose down` → `rm -rf ./lib/ojdbc8.jar` → Tải lại file driver → `docker compose up -d`.
+
+### 4.3. Tạo File `docker-compose.yml`
+```bash
+nano docker-compose.yml
+```
+
+Dán nội dung sau:
+```yaml
+services:
+  camunda-app:
+    image: camunda/camunda-bpm-platform:tomcat-latest
+    container_name: camunda-app
+    ports:
+      - "8080:8080"
+    environment:
+      # Cấu hình kết nối Oracle Database
+      - DB_DRIVER=oracle.jdbc.driver.OracleDriver
+      - DB_URL=jdbc:oracle:thin:@//192.168.1.127:1521/XEPDB1
+      - DB_USERNAME=DOCKER_CAMUNDA
+      - DB_PASSWORD=admin123
+      # Số kết nối tối đa trong Connection Pool
+      - DB_CONN_LIMIT=50
+      # Câu lệnh kiểm tra kết nối còn sống (Đặc thù Oracle dùng FROM DUAL)
+      - DB_VALIDATION_QUERY=SELECT 1 FROM DUAL
+    volumes:
+      # Mount driver Oracle vào Tomcat (CHỈ MOUNT ĐÚNG 1 FILE, KHÔNG MOUNT CẢ THƯ MỤC)
+      - ./lib/ojdbc8.jar:/camunda/lib/ojdbc8.jar
+    restart: always
+```
+
+> [!IMPORTANT]
+> **Giải thích quan trọng về Volume Mount:**
+>
+> | Cú pháp | Hành vi | Hậu quả |
+> | :--- | :--- | :--- |
+> | `./lib:/camunda/lib` | Mount **cả thư mục** → Đè toàn bộ thư viện gốc của Tomcat | ❌ Tomcat mất hết thư viện, **KHÔNG KHỞI ĐỘNG ĐƯỢC** |
+> | `./lib/ojdbc8.jar:/camunda/lib/ojdbc8.jar` | Mount **đúng 1 file** → Chèn thêm file vào thư mục có sẵn | ✅ Các thư viện gốc vẫn nguyên vẹn, chỉ thêm driver Oracle |
+>
+> Tương tự, **KHÔNG ĐƯỢC** mount `./webapps:/camunda/webapps` vì sẽ che khuất toàn bộ các ứng dụng web mặc định (Cockpit, Tasklist, Admin, REST API) dẫn đến lỗi **HTTP 404**.
+
+### 4.4. Khởi Động Camunda
+```bash
+docker compose up -d
+```
+
+### 4.5. Theo Dõi Log Khởi Động
+```bash
+docker compose logs -f camunda-app
+```
+
+**Các dấu hiệu khởi động thành công (theo thứ tự xuất hiện trong log):**
+
+| Thứ tự | Dòng log quan trọng | Ý nghĩa |
+| :--- | :--- | :--- |
+| 1 | `Configure database` | Bắt đầu cấu hình kết nối DB |
+| 2 | `Performing database operation 'create' on component 'engine'` | Đang tạo bảng hệ thống trên Oracle (chỉ xuất hiện lần đầu) |
+| 3 | `ENGINE-00001 Process Engine default created.` | Engine Camunda khởi tạo thành công |
+| 4 | `Camunda Platform sucessfully started at 'Apache Tomcat/10.1.43'.` | ✅ **THÀNH CÔNG HOÀN TOÀN** |
+
+*(Nhấn `Ctrl + C` để thoát khỏi chế độ xem log)*
+
+---
+
+## 5. Truy Cập Và Sử Dụng
+
+### 5.1. Đăng Nhập Giao Diện Web
+Mở trình duyệt (Chrome/Edge) trên máy Windows và truy cập:
+
+| Giao diện | Đường dẫn |
+| :--- | :--- |
+| **Trang chào mừng** | `http://<IP_SERVER>:8080/camunda-welcome/` |
+| **Cockpit (Giám sát quy trình)** | `http://<IP_SERVER>:8080/camunda/app/cockpit/` |
+| **Tasklist (Xử lý công việc)** | `http://<IP_SERVER>:8080/camunda/app/tasklist/` |
+| **Admin (Quản trị User/Group)** | `http://<IP_SERVER>:8080/camunda/app/admin/` |
+| **REST API** | `http://<IP_SERVER>:8080/engine-rest/` |
+
+* **Tài khoản mặc định:** `demo` / `demo`
+
+### 5.2. Deploy File `.war` Của Riêng Bạn
+Khi bạn có file quy trình nghiệp vụ đóng gói dạng `.war`, sử dụng lệnh `docker cp` để chèn thẳng vào Tomcat đang chạy:
+```bash
+docker cp my-bank-process.war camunda-app:/camunda/webapps/
+```
+Tomcat sẽ tự động phát hiện và deploy (Hot Deploy) ngay lập tức mà không cần restart container hay ảnh hưởng đến các app gốc của Camunda.
+
+---
+
+## 6. Các Lệnh Quản Trị Thường Dùng
+
+```bash
+# Xem log thời gian thực
+docker compose logs -f camunda-app
+
+# Dừng hệ thống
+docker compose down
+
+# Khởi động lại
+docker compose up -d
+
+# Khởi động lại container (giữ nguyên cấu hình)
+docker compose restart
+
+# Xóa sạch để cài lại từ đầu (MẤT DỮ LIỆU trong container, DB Oracle không ảnh hưởng)
+docker compose down -v
+```
+
+---
+
+## 7. Bảng Tổng Hợp Lỗi Thường Gặp & Cách Xử Lý
+
+| Lỗi | Nguyên nhân | Cách xử lý |
+| :--- | :--- | :--- |
+| **`ClassNotFoundException: oracle.jdbc`** | File `ojdbc8.jar` bị Docker tạo nhầm thành thư mục rỗng | `docker compose down` → `rm -rf ./lib/ojdbc8.jar` → Tải lại file `.jar` thật → `docker compose up -d` |
+| **HTTP 404 trên trình duyệt** | Mount `./webapps:/camunda/webapps` che khuất app gốc | Xóa dòng mount webapps, dùng `docker cp` để deploy `.war` |
+| **Trình duyệt báo "Site cannot be reached"** | Tường lửa chưa mở cổng 8080 | `firewall-cmd --permanent --add-port=8080/tcp && firewall-cmd --reload` |
+| **`Unregistering BPM Platform Plugins: service is null`** | Đây **KHÔNG phải lỗi gốc**. Lỗi thật nằm ở các dòng log phía trên (thường là lỗi kết nối DB hoặc thiếu driver) | Cuộn log lên trên, tìm dòng `Caused by:` để xác định lỗi gốc thực sự |
+| **`ORA-01017: invalid username/password`** | Sai thông tin đăng nhập Oracle trong `docker-compose.yml` | Kiểm tra lại `DB_USERNAME`, `DB_PASSWORD`. Thử kết nối bằng DataGrip/SQL Developer để xác nhận |
+| **`ORA-12541: TNS no listener`** | Oracle Server không lắng nghe kết nối hoặc sai IP/Port | Kiểm tra lại `DB_URL`, thử telnet tới IP:Port của Oracle từ server Rocky Linux |

@@ -1,0 +1,69 @@
+# Kafka Microservices Deployment & Architecture Wiki
+
+Tài liệu này tổng hợp toàn bộ quy trình xây dựng, triển khai và kiến trúc hệ thống Kafka Microservices thực tế.
+
+## 1. Kiến trúc hệ thống (Architecture)
+Hệ thống được thiết kế theo mô hình **Event-Driven Architecture (EDA)**:
+- **Producer (Bank.Api)**: Tiếp nhận request từ khách hàng, xử lý logic nghiệp vụ và đẩy sự kiện vào Kafka.
+- **Message Broker (Kafka & Zookeeper)**: Lưu trữ tin nhắn an toàn, đảm bảo tin nhắn không bị mất kể cả khi Consumer đang tắt.
+- **Consumers (Notification.Worker)**:
+    - **NotificationService**: Lắng nghe để gửi Email cho khách hàng.
+    - **AuditService**: Lắng nghe để ghi nhật ký giao dịch vào hệ thống kiểm toán.
+
+> [!NOTE]
+> Trong môi trường lớn (Enterprise), Kafka thường là một **Cụm dùng chung (Shared Cluster)** cho nhiều phòng ban.
+ Mỗi nghiệp vụ mới sẽ tạo thêm các **Topic** mới thay vì dựng lại toàn bộ hạ tầng Kafka.
+
+---
+
+## 2. Các thành phần hạ tầng
+- **Zookeeper (`cp-zookeeper`)**: Đóng vai trò là "Người điều phối", quản lý danh sách các Broker và bầu chọn Leader.
+- **Kafka (`cp-kafka`)**: Đóng vai trò là "Kho lưu trữ tin nhắn", tiếp nhận và phân phối dữ liệu cho các Consumer.
+- **Confluent Platform Images**: Chúng ta sử dụng Image của Confluent vì chúng được tối ưu hóa cho doanh nghiệp,
+ dễ cấu hình và ổn định hơn bản Apache thuần túy.
+
+---
+
+## 3. Quy trình triển khai (Deployment Workflow)
+
+### Bước 1: Phát triển & Đóng gói (Windows)
+1.  **Viết Code**: Sử dụng thư viện `Confluent.Kafka` cho .NET 8.
+2.  **Docker Build**: Đóng gói mã nguồn thành Image.
+    ```bash
+    docker build -t <username>/bank-api:latest ./ApacheKafka
+    docker build -t <username>/notification-worker:latest ./Notification.Worker
+    ```
+3.  **Docker Push**: Đẩy Image lên Docker Hub.
+    ```bash
+    docker push <username>/bank-api:latest
+    docker push <username>/notification-worker:latest
+    ```
+
+### Bước 2: Triển khai hạ tầng (Server Linux)
+Sử dụng Docker Compose để khởi chạy toàn bộ hệ thống chỉ với 1 file cấu hình duy nhất.
+
+**Lệnh quan trọng trên Server:**
+- `docker compose pull`: Tải bản code mới nhất từ Docker Hub về Server.
+- `docker compose up -d`: Khởi động hệ thống ở chế độ chạy ngầm.
+- `docker compose restart`: Khởi động lại các container khi thay đổi cấu hình.
+
+---
+
+## 4. Các lỗi thường gặp & Cách xử lý (Troubleshooting)
+
+| Lỗi | Nguyên nhân | Cách xử lý |
+| :--- | :--- | :--- |
+| `Connection refused` | Kafka chưa mở cổng cho mạng nội bộ. | Thêm `KAFKA_LISTENERS` vào file cấu hình. |
+| `Unknown topic or partition` | Consumer truy cập vào topic chưa tồn tại. | Gọi API (Producer) ít nhất 1 lần để tạo topic tự động. |
+| `Authentication Failed (535)` | Gmail từ chối mật khẩu cá nhân. | Sử dụng **Google App Password** (16 ký tự). |
+| `1/1 brokers are down` | Ứng dụng khởi động quá nhanh khi Kafka chưa kịp sẵn sàng. | Chờ 15-30 giây và khởi động lại container ứng dụng. |
+
+---
+
+## 5. Lệnh kiểm tra Log
+- `docker logs -f bank-api`: Xem log API thời gian thực.
+- `docker logs -f notification-worker`: Theo dõi quá trình xử lý tin nhắn và gửi Email.
+- `docker logs kafka`: Kiểm tra sức khỏe của lõi Kafka.
+
+---
+*Tài liệu được biên soạn cho dự án Kafka Microservices Demo - 2026.*

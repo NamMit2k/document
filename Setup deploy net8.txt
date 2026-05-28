@@ -1,0 +1,146 @@
+1. Tạo cấu trúc thư mục
+-- Nếu tạo nhiều project khác nhau
+sudo mkdir -p /var/www/appdemo
+sudo mkdir -p /var/www/appdemo2
+
+2. Copy source publish lên server
+3. Cài .NET runtime
+sudo dnf install dotnet-sdk-8.0 -y
+
+4. Cài Nginx (Check xem được cài chưa nginx -v)
+sudo dnf install nginx -y
+sudo systemctl enable nginx
+sudo systemctl start nginx
+
+5. Firewall mở HTTP
+sudo firewall-cmd --add-service=http --permanent
+sudo firewall-cmd --reload
+
+6. Chạy app test (API1)
+cd /var/www/appdemo (cd vào folder chứa source)
+dotnet Api1.dll --urls "http://0.0.0.0:5000"
+
+7. Chạy nền (không chết khi logout) Phải run ứng dụng (Đây là test nhanh start app thành công)
+nohup dotnet Api1.dll --urls "http://0.0.0.0:5000" > api1.log 2>&1 &
+Nếu thành công thì cấu hình thành 1 service để giữ app sống
+pkill -f Api1.dll (Kill app cũ đi)
+sudo vi /etc/systemd/system/appdemo.service
+[Unit]
+Description=API1 Service
+
+[Service]
+WorkingDirectory=/var/www/appdemo
+ExecStart=/usr/bin/dotnet Api1.dll
+Restart=always
+Environment=ASPNETCORE_URLS=http://0.0.0.0:5000
+
+[Install]
+WantedBy=multi-user.target
+--Lưu lại
+sudo systemctl daemon-reload
+sudo systemctl enable api1
+sudo systemctl start api1
+
+8. Cấu hình Nginx multi service
+sudo vi /etc/nginx/conf.d/multi-app.conf 
+(Nếu sửa thì nhấn i)
+(Lưu thì Esc :wq)
+// Config mẫu của dùng đường dẫn. VD: http://192.168.1.151/appdemo/swagger/index.html
+server {
+    listen 80;
+
+    # ===== API 1 =====
+    location /appdemo/ {
+        proxy_pass http://127.0.0.1:5000/;
+
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+
+    # ===== API 2 =====
+    location /api2/ {
+        proxy_pass http://localhost:5001/;
+        proxy_http_version 1.1;
+
+        proxy_set_header Upgrade $http_upgrade;
+        proxy_set_header Connection keep-alive;
+        proxy_set_header Host $host;
+        proxy_cache_bypass $http_upgrade;
+    }
+
+    # ===== THÊM ĐOẠN NÀY VÀO CUỐI =====
+    location / {
+        # Kiểm tra nếu request đến từ trình duyệt đang mở trang appdemo
+        if ($http_referer ~* /appdemo/) {
+            rewrite ^/(.*) /appdemo/$1 last;
+        }
+
+        # Kiểm tra nếu request đến từ trình duyệt đang mở trang api2
+        if ($http_referer ~* /api2/) {
+            rewrite ^/(.*) /api2/$1 last;
+        }
+
+        # Nếu không khớp cái nào thì trả về 404 như cũ
+        return 404;
+    }
+}
+
+##Config mẫu của dùng port. VD: http://192.168.1.151:8077/swagger/index.html
+
+##Cấp quyền SELinux (Bắt buộc): Cho phép Nginx lắng nghe trên cổng lạ.
+sudo dnf install policycoreutils-python-utils -y
+sudo semanage port -a -t http_port_t -p tcp 8077
+
+##Mở Firewall (Tường lửa): Cho phép máy bên ngoài truy cập vào cổng này.
+sudo firewall-cmd --permanent --add-port=8077/tcp
+sudo firewall-cmd --reload
+
+# API 1 chạy cổng 8077
+server {
+    listen 8077;
+    server_name 192.168.1.151;
+
+    location / {
+        proxy_pass http://127.0.0.1:5000/; # Trỏ vào port của API 1
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+    }
+}
+
+# API 2 chạy cổng 8078 (ví dụ thế)
+server {
+    listen 8078;
+    server_name 192.168.1.151;
+
+    location / {
+        proxy_pass http://127.0.0.1:5001/; # Trỏ vào port của API 2
+        proxy_set_header Host $host;
+        # ... các config khác
+    }
+}
+9.Restart Nginx
+sudo nginx -t
+sudo systemctl restart nginx
+
+10.Fix SELinux (rất quan trọng)
+setsebool -P httpd_can_network_connect 1
+
+11. Test với máy ngoài http://192.168.1.151/appdemo/swagger/index.html
+
+Note:
+Sau khi cài đặt cổng kết nối mới trên linux thì phải đóng cổng net lại
+Chặn trên server
+Port 5000 là tùy từng project
+sudo firewall-cmd --permanent --remove-port=5000/tcp
+sudo firewall-cmd --reload
+
+1. Restart app
+systemctl restart appdemo
+2. Xem log
+journalctl -u appdemo -f
+3. Stop app
+systemctl stop appdemo

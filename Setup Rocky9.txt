@@ -1,0 +1,42 @@
+1.Download ISO Rocky 9 (Minimal)
+
+2. Tạo máy ảo (VM)
+OS Version: Red Hat Enterprise Linux 8 (64-bit)
+Disk: 20-40GB
+Customize Hardware
+CPU: 2–4 core
+RAM: 4GB
+Network: NAT (dễ) hoặc Bridged (Cho bên ngoài kết nối vào). Thường là Bridged
+---Next 
+
+3. Cài Rocky Linux
+Trong màn hình cài:
+
+Chọn: Install Rocky Linux
+Software → Minimal Install
+Disk → Automatic
+Network → ON
+Hostname → đặt tên server
+User → tạo user + tick admin
+Root password → đặt luôn
+=>Begin Installation
+
+4. Sau khi cài xong
+Reboot
+Tháo ISO
+Vào màn hình: => Login bằng user/pass vừa tạo
+
+5. Update và kiểm tra hệ thống
+sudo dnf update -y
+ip a
+👉 Có IP là OK
+
+6. Cài .NET version (để deploy app)
+VD NET 8
+sudo rpm -Uvh https://packages.microsoft.com/config/rhel/9/packages-microsoft-prod.rpm
+sudo dnf install dotnet-sdk-8.0 -y
+
+5. Cài Nginx (Check xem được cài chưa nginx -v)
+sudo dnf install nginx -y
+sudo systemctl enable nginx
+sudo systemctl start nginx

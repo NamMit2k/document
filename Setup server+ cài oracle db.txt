@@ -1,0 +1,566 @@
+# Kịch Bản Cài Đặt Oracle Linux 8 Trên VMware Và Oracle Database 21c
+
+Tài liệu này mô tả kịch bản cài đặt **Oracle Linux 8 (OL8)** trên **VMware** và cài **Oracle Database 21c XE** trong máy ảo. Phương án này phù hợp cho học tập, lab, dev/test.
+
+> Lưu ý: Oracle Database 21c là bản innovation release. Nếu dùng cho production mới, nên cân nhắc Oracle 19c LTS hoặc phiên bản Oracle mới hơn đang được hỗ trợ dài hạn. Oracle 21c XE phù hợp cho học tập, lab, dev/test.
+
+## 1. Mục Tiêu Triển Khai
+
+Mô hình:
+
+```text
+Windows / Laptop / Server vật lý
+        |
+      VMware
+        |
+Oracle Linux 8 VM
+        |
+Oracle Database 21c XE
+        |
+Listener: 1521
+EM Express: 5500
+Service: XEPDB1
+```
+
+Thông tin mục tiêu:
+
+```text
+Tên VM: oracle21c-ol8
+Hệ điều hành: Oracle Linux 8 x86_64
+Database: Oracle Database 21c XE
+Hostname: oracle21c.local
+IP ví dụ: 192.168.1.50
+Listener port: 1521
+EM Express port: 5500
+PDB service: XEPDB1
+```
+
+## 2. Chuẩn Bị
+
+Tải các file sau:
+
+- Oracle Linux 8 ISO: https://yum.oracle.com/oracle-linux-isos.html
+- Oracle Database 21c XE Linux RPM: https://www.oracle.com/database/technologies/xe-downloads.html
+
+File RPM cần tải:
+
+```text
+oracle-database-xe-21c-1.0-1.ol8.x86_64.rpm
+```
+
+## 3. Cấu Hình VM Khuyến Nghị
+
+```text
+CPU: 4 vCPU
+RAM: tối thiểu 8 GB, tốt hơn là 12-16 GB
+Disk: 100 GB
+Network: Bridged nếu máy khác trong LAN cần truy cập database
+Network: NAT nếu chỉ dùng từ máy host
+OS type: Linux
+OS version: Oracle Linux 8 64-bit hoặc Red Hat Enterprise Linux 8 64-bit
+```
+
+Nếu chỉ làm lab nhỏ, có thể dùng:
+
+```text
+CPU: 2 vCPU
+RAM: 6 GB
+Disk: 60 GB
+```
+
+Tuy nhiên cấu hình khuyến nghị vẫn là `4 vCPU`, `8 GB RAM`, `100 GB disk`.
+
+## 4. Tạo VM Trên VMware
+
+Trong VMware Workstation/Player:
+
+```text
+Create a New Virtual Machine
+> Typical
+> Installer disc image file: chọn Oracle Linux 8 ISO
+> Guest OS: Linux
+> Version: Oracle Linux 8 64-bit hoặc Red Hat Enterprise Linux 8 64-bit
+> VM name: oracle21c-ol8
+> Disk: 100 GB
+> Customize Hardware
+```
+
+Cấu hình phần cứng:
+
+```text
+Memory: 8192 MB
+Processors: 2 processors x 2 cores hoặc 1 processor x 4 cores
+Hard Disk: 100 GB
+Network Adapter: Bridged hoặc NAT
+CD/DVD: Oracle Linux 8 ISO
+USB/Sound/Printer: có thể remove nếu không cần
+```
+
+## 5. Cài Oracle Linux 8
+
+Boot VM từ ISO, chọn:
+
+```text
+Install Oracle Linux 8.x
+```
+
+Trong giao diện cài đặt:
+
+```text
+Language: English
+Keyboard: English US
+Time & Date: Asia/Ho_Chi_Minh
+Software Selection: Server with GUI hoặc Server
+Installation Destination: chọn disk 100 GB
+Network & Host Name: bật ON
+Hostname: oracle21c.local
+Root Password: đặt password root
+User Creation: tạo user admin và tick Make this user administrator
+```
+
+Phân vùng khuyến nghị nếu chọn custom:
+
+```text
+/boot       1 GB      xfs
+/boot/efi   600 MB    efi, nếu dùng UEFI
+/           35 GB     xfs
+/u01        50 GB     xfs
+swap        8 GB
+/home       phần còn lại, xfs
+```
+
+Nếu muốn đơn giản, có thể chọn automatic partitioning. Tuy nhiên, nên có `/u01` riêng vì Oracle thường đặt software và data tại đây.
+
+Sau khi cài xong, login bằng user admin.
+
+## 6. Cập Nhật Hệ Điều Hành
+
+```bash
+sudo dnf update -y
+sudo reboot
+```
+
+Sau khi reboot:
+
+```bash
+cat /etc/os-release
+hostnamectl
+ip a
+```
+
+## 7. Cấu Hình Network Và Hostname
+
+Kiểm tra card mạng:
+
+```bash
+ip a
+nmcli con show
+```
+
+Nếu dùng DHCP, ghi lại IP hiện tại. Nếu muốn IP tĩnh, ví dụ card mạng là `ens160`:
+
+```bash
+sudo nmcli con mod ens160 ipv4.addresses 192.168.1.50/24
+sudo nmcli con mod ens160 ipv4.gateway 192.168.1.1
+sudo nmcli con mod ens160 ipv4.dns "8.8.8.8 1.1.1.1"
+sudo nmcli con mod ens160 ipv4.method manual
+sudo nmcli con up ens160
+```
+
+Đặt hostname:
+
+```bash
+sudo hostnamectl set-hostname oracle21c.local
+```
+
+Sửa file `/etc/hosts`:
+
+```bash
+sudo vi /etc/hosts
+```
+
+Thêm dòng sau, thay IP theo môi trường của bạn:
+
+```text
+127.0.0.1       localhost
+192.168.1.50    oracle21c.local oracle21c
+```
+
+Kiểm tra:
+
+```bash
+hostname
+hostname -f
+ping -c 3 oracle21c.local
+```
+
+## 8. Chuẩn Bị OS Cho Oracle
+
+Cài gói preinstall:
+
+```bash
+sudo dnf install -y oracle-database-preinstall-21c
+```
+
+Gói này tự cấu hình:
+
+- User `oracle`
+- Group `oinstall`, `dba`
+- Kernel parameters
+- User limits
+- Các dependency cơ bản
+
+Đặt password cho user `oracle`:
+
+```bash
+sudo passwd oracle
+```
+
+Tạo thư mục Oracle nếu chưa có `/u01`:
+
+```bash
+sudo mkdir -p /u01/app/oracle
+sudo chown -R oracle:oinstall /u01
+sudo chmod -R 775 /u01
+```
+
+Kiểm tra user:
+
+```bash
+id oracle
+```
+
+## 9. Copy File Oracle 21c XE RPM Vào VM
+
+Copy file đã tải vào VM, ví dụ:
+
+```text
+/home/admin/oracle-database-xe-21c-1.0-1.ol8.x86_64.rpm
+```
+
+Có thể dùng VMware shared folder, SCP, WinSCP hoặc copy qua USB.
+
+Ví dụ dùng `scp` từ máy host Linux/macOS:
+
+```bash
+scp oracle-database-xe-21c-1.0-1.ol8.x86_64.rpm admin@192.168.1.50:/home/admin/
+```
+
+## 10. Cài Oracle Database 21c XE
+
+Tại VM, chạy:
+
+```bash
+cd /home/admin
+sudo dnf install -y ./oracle-database-xe-21c-1.0-1.ol8.x86_64.rpm
+```
+
+Sau khi cài package xong, chạy cấu hình database:
+
+```bash
+sudo /etc/init.d/oracle-xe-21c configure
+```
+
+Nhập password cho database admin users. Password này dùng cho:
+
+```text
+SYS
+SYSTEM
+PDBADMIN
+```
+
+Ví dụ password:
+
+```text
+Oracle@123456
+```
+
+Quá trình configure có thể mất vài phút.
+
+## 11. Cấu Hình Firewall
+
+Mở port Oracle Listener và EM Express:
+
+```bash
+sudo firewall-cmd --permanent --add-port=1521/tcp
+sudo firewall-cmd --permanent --add-port=5500/tcp
+sudo firewall-cmd --reload
+```
+
+Kiểm tra:
+
+```bash
+sudo firewall-cmd --list-ports
+```
+
+## 12. Cấu Hình Auto Start
+
+Kiểm tra service:
+
+```bash
+sudo systemctl status oracle-xe-21c
+```
+
+Bật tự chạy cùng OS:
+
+```bash
+sudo systemctl enable oracle-xe-21c
+sudo systemctl start oracle-xe-21c
+```
+
+Kiểm tra listener:
+
+```bash
+sudo su - oracle
+lsnrctl status
+```
+
+## 13. Cấu Hình Biến Môi Trường Cho User Oracle
+
+Login user `oracle`:
+
+```bash
+sudo su - oracle
+```
+
+Sửa file:
+
+```bash
+vi ~/.bash_profile
+```
+
+Thêm cuối file:
+
+```bash
+export ORACLE_SID=XE
+export ORAENV_ASK=NO
+. /opt/oracle/product/21c/dbhomeXE/bin/oraenv
+export ORAENV_ASK=YES
+```
+
+Load lại:
+
+```bash
+source ~/.bash_profile
+```
+
+Kiểm tra:
+
+```bash
+echo $ORACLE_HOME
+echo $ORACLE_SID
+sqlplus -v
+```
+
+## 14. Kiểm Tra Database
+
+Login SQL*Plus:
+
+```bash
+sqlplus / as sysdba
+```
+
+Chạy:
+
+```sql
+SELECT name, open_mode FROM v$database;
+SHOW PDBS;
+```
+
+Kết quả mong muốn:
+
+```text
+Database name: XE
+PDB: XEPDB1
+Open mode: READ WRITE
+```
+
+Nếu `XEPDB1` chưa open:
+
+```sql
+ALTER PLUGGABLE DATABASE XEPDB1 OPEN;
+ALTER PLUGGABLE DATABASE XEPDB1 SAVE STATE;
+```
+
+Thoát:
+
+```sql
+EXIT;
+```
+
+## 15. Test Kết Nối Local
+
+Từ trong VM:
+
+```bash
+sqlplus system/Oracle@123456@//localhost:1521/XEPDB1
+```
+
+Nếu password có ký tự đặc biệt gây lỗi shell, dùng dấu nháy:
+
+```bash
+sqlplus 'system/Oracle@123456@//localhost:1521/XEPDB1'
+```
+
+## 16. Test Kết Nối Từ Máy Host
+
+Từ SQL Developer, DBeaver, DataGrip hoặc ứng dụng:
+
+```text
+Connection type: Basic
+Host: 192.168.1.50
+Port: 1521
+Service name: XEPDB1
+Username: system
+Password: Oracle@123456
+```
+
+JDBC URL:
+
+```text
+jdbc:oracle:thin:@//192.168.1.50:1521/XEPDB1
+```
+
+Nếu không kết nối được, kiểm tra:
+
+```bash
+ip a
+sudo firewall-cmd --list-ports
+sudo systemctl status oracle-xe-21c
+sudo su - oracle
+lsnrctl status
+```
+
+## 17. Tạo User Schema Cho Ứng Dụng
+
+Không nên dùng `SYSTEM` cho ứng dụng.
+
+Login:
+
+```bash
+sqlplus 'system/Oracle@123456@//localhost:1521/XEPDB1'
+```
+
+Tạo schema:
+
+```sql
+CREATE USER appuser IDENTIFIED BY "AppUser@123456";
+GRANT CREATE SESSION TO appuser;
+GRANT CREATE TABLE TO appuser;
+GRANT CREATE VIEW TO appuser;
+GRANT CREATE SEQUENCE TO appuser;
+GRANT CREATE PROCEDURE TO appuser;
+ALTER USER appuser QUOTA UNLIMITED ON USERS;
+```
+
+Test:
+
+```bash
+sqlplus 'appuser/AppUser@123456@//localhost:1521/XEPDB1'
+```
+
+## 18. Lệnh Quản Trị Cơ Bản
+
+Start database service:
+
+```bash
+sudo systemctl start oracle-xe-21c
+```
+
+Stop database service:
+
+```bash
+sudo systemctl stop oracle-xe-21c
+```
+
+Restart database service:
+
+```bash
+sudo systemctl restart oracle-xe-21c
+```
+
+Xem trạng thái:
+
+```bash
+sudo systemctl status oracle-xe-21c
+```
+
+Xem listener:
+
+```bash
+sudo su - oracle
+lsnrctl status
+```
+
+Xem log database:
+
+```bash
+sudo su - oracle
+cd /opt/oracle/diag/rdbms/xe/XE/trace
+tail -f alert_XE.log
+```
+
+Vào DB bằng SYSDBA:
+
+```bash
+sudo su - oracle
+sqlplus / as sysdba
+```
+
+Mở PDB nếu cần:
+
+```sql
+ALTER PLUGGABLE DATABASE XEPDB1 OPEN;
+ALTER PLUGGABLE DATABASE XEPDB1 SAVE STATE;
+```
+
+## 19. Snapshot Sau Khi Cài Xong
+
+Sau khi test kết nối OK, nên tạo snapshot sạch.
+
+Dừng database:
+
+```bash
+sudo systemctl stop oracle-xe-21c
+sudo shutdown now
+```
+
+Trong VMware:
+
+```text
+Snapshot > Take Snapshot
+Name: clean-oracle21c-xe-installed
+Description: Oracle Linux 8 + Oracle 21c XE installed and tested
+```
+
+## 20. Checklist Hoàn Thành
+
+```text
+[ ] VM Oracle Linux 8 chạy ổn
+[ ] IP cố định hoặc IP DHCP đã ghi lại
+[ ] Hostname đúng
+[ ] oracle-database-preinstall-21c đã cài
+[ ] Oracle 21c XE RPM đã cài
+[ ] /etc/init.d/oracle-xe-21c configure chạy thành công
+[ ] Port 1521 đã mở
+[ ] Port 5500 đã mở
+[ ] Service oracle-xe-21c đã enable
+[ ] sqlplus / as sysdba OK
+[ ] XEPDB1 READ WRITE
+[ ] Kết nối từ máy host OK
+[ ] Đã tạo user/schema riêng cho ứng dụng
+[ ] Đã tạo snapshot sạch
+```
+
+## 21. Ghi Chú License
+
+- Oracle Database 21c XE phù hợp cho học tập, lab, dev/test và có giới hạn tài nguyên.
+- Nếu dùng Oracle Database Enterprise Edition hoặc Standard Edition cho production/commercial, cần license hợp lệ.
+- Oracle không yêu cầu nhập license key khi cài đặt, nhưng việc sử dụng vẫn phải đúng điều khoản license.
+
+## 22. Nguồn Tham Khảo
+
+- Oracle Linux ISO: https://yum.oracle.com/oracle-linux-isos.html
+- Oracle Database XE downloads: https://www.oracle.com/database/technologies/xe-downloads.html
+- Oracle Database 21c Linux downloads: https://www.oracle.com/database/technologies/oracle21c-linux-downloads.html
+- Oracle Database 21c installation docs: https://docs.oracle.com/en/database/oracle/oracle-database/21/install-and-upgrade.html

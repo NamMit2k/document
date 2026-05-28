@@ -1,0 +1,707 @@
+# Kịch bản cài đặt Server 1: Camunda 7 Tomcat Production trên Rocky Linux 9
+
+Tài liệu này mô tả chi tiết cách dựng **Server 1** cho môi trường production hoặc pre-production:
+
+```text
+Server 1: Camunda 7 + Tomcat + Nginx reverse proxy
+OS: Rocky Linux 9
+Java: OpenJDK 17
+Camunda: 7.24.0 Tomcat distribution
+Port nội bộ Tomcat: 8080
+Port public: 80/443 qua Nginx
+DB hiện tại: H2 tạm thời
+DB sau này: Oracle ở server khác
+Đường dẫn thực tế sau giải nén: /opt/camunda/apache-tomcat-10.1.43
+```
+
+## 0. Những điểm đã điều chỉnh so với tài liệu ban đầu
+
+Trong quá trình cài thực tế trên server `Rocky9Base`, có một số điểm khác với tài liệu ban đầu:
+
+```text
+1. Tomcat không nằm trong /opt/camunda/server/apache-tomcat-...
+2. Tomcat nằm trực tiếp tại /opt/camunda/apache-tomcat-10.1.43
+3. H2 mặc định cố tạo thư mục /camunda-h2-dbs nên user camunda bị lỗi AccessDenied
+4. Log Tomcat không nằm trong /var/log mà nằm trong thư mục Tomcat
+5. SFTP không thấy thư mục logs do quyền /opt/camunda ban đầu là 700
+```
+
+Vì vậy các path trong tài liệu này dùng theo thực tế:
+
+```text
+Tomcat home: /opt/camunda/apache-tomcat-10.1.43
+Startup:     /opt/camunda/apache-tomcat-10.1.43/bin/startup.sh
+Shutdown:    /opt/camunda/apache-tomcat-10.1.43/bin/shutdown.sh
+Config:      /opt/camunda/apache-tomcat-10.1.43/conf
+Logs:        /opt/camunda/apache-tomcat-10.1.43/logs
+```
+
+## 1. Kiến trúc Server 1
+
+Mô hình truy cập:
+
+```text
+Client / Browser / External System
+        |
+        | HTTP 80 hoặc HTTPS 443
+        v
+Nginx reverse proxy
+        |
+        | localhost:8080
+        v
+Camunda 7 Tomcat
+        |
+        v
+H2 tạm thời hoặc Oracle DB sau này
+```
+
+Nguyên tắc production:
+
+```text
+Không public trực tiếp port 8080
+Tomcat chỉ listen localhost:8080
+Nginx đứng trước để xử lý HTTP/HTTPS
+Camunda chạy bằng user riêng, không chạy bằng root
+Service tự start sau reboot
+Có log rotation
+```
+
+## 2. Chuẩn bị server
+
+Đăng nhập server bằng user có quyền `sudo`.
+
+Kiểm tra thông tin hệ thống:
+
+```bash
+hostnamectl
+cat /etc/rocky-release
+ip addr
+free -h
+df -h
+```
+
+Cập nhật OS:
+
+```bash
+sudo dnf update -y
+sudo reboot
+```
+
+Sau khi reboot, đăng nhập lại và cài package cần thiết:
+
+```bash
+sudo dnf install -y java-17-openjdk wget tar unzip vim curl firewalld nginx
+```
+
+Kiểm tra Java:
+
+```bash
+java -version
+```
+
+Bật firewall và enable Nginx:
+
+```bash
+sudo systemctl enable --now firewalld
+sudo systemctl enable nginx
+```
+
+## 3. Tạo user chạy Camunda
+
+Không nên chạy Camunda bằng user `root`. Tạo user riêng:
+
+```bash
+sudo useradd -r -m -d /opt/camunda -s /sbin/nologin camunda
+```
+
+Kiểm tra:
+
+```bash
+id camunda
+ls -ld /opt/camunda
+```
+
+## 4. Tải và cài Camunda Tomcat
+
+Tải Camunda 7.24.0 Tomcat distribution:
+
+```bash
+cd /tmp
+wget https://downloads.camunda.cloud/release/camunda-bpm/tomcat/7.24/camunda-bpm-tomcat-7.24.0.tar.gz
+```
+
+Giải nén vào `/opt/camunda`:
+
+```bash
+sudo tar -xzf camunda-bpm-tomcat-7.24.0.tar.gz -C /opt/camunda --strip-components=1
+sudo chown -R camunda:camunda /opt/camunda
+```
+
+Kiểm tra thư mục:
+
+```bash
+ls -lah /opt/camunda
+ls -lah /opt/camunda/apache-tomcat-10.1.43
+```
+
+Với package `camunda-bpm-tomcat-7.24.0.tar.gz` đang dùng, Tomcat nằm trực tiếp tại:
+
+```text
+/opt/camunda/apache-tomcat-10.1.43
+```
+
+Không dùng path cũ:
+
+```text
+/opt/camunda/server/apache-tomcat-...
+```
+
+## 5. Chạy thử Camunda bằng H2
+
+Start thủ công:
+
+```bash
+sudo -u camunda /opt/camunda/apache-tomcat-10.1.43/bin/startup.sh
+```
+
+Kiểm tra port:
+
+```bash
+ss -lntp | grep 8080
+```
+
+Kiểm tra bằng `curl` trên chính server:
+
+```bash
+curl -I http://localhost:8080/camunda
+curl http://localhost:8080/engine-rest/engine
+```
+
+Nếu cần truy cập trực tiếp từ máy ngoài trong giai đoạn test:
+
+```bash
+sudo firewall-cmd --add-port=8080/tcp --permanent
+sudo firewall-cmd --reload
+```
+
+Truy cập:
+
+```text
+http://<IP_SERVER_1>:8080/camunda
+```
+
+Dừng Camunda để chuyển sang chạy bằng `systemd`:
+
+```bash
+sudo -u camunda /opt/camunda/apache-tomcat-10.1.43/bin/shutdown.sh
+```
+
+## 6. Tạo systemd service cho Camunda
+
+Lấy chính xác tên thư mục Tomcat:
+
+```bash
+ls /opt/camunda/
+```
+
+Ví dụ:
+
+```text
+apache-tomcat-10.1.43
+```
+
+Tạo file service:
+
+```bash
+sudo vim /etc/systemd/system/camunda.service
+```
+
+Nội dung mẫu theo server thực tế:
+
+```ini
+[Unit]
+Description=Camunda 7 Tomcat
+After=network.target
+
+[Service]
+Type=forking
+User=camunda
+Group=camunda
+
+Environment=JAVA_HOME=/usr/lib/jvm/jre
+Environment=CATALINA_HOME=/opt/camunda/apache-tomcat-10.1.43
+Environment=CATALINA_BASE=/opt/camunda/apache-tomcat-10.1.43
+Environment=JAVA_OPTS=-Xms2g -Xmx4g -XX:+UseG1GC -Djava.awt.headless=true
+
+ExecStart=/opt/camunda/apache-tomcat-10.1.43/bin/startup.sh
+ExecStop=/opt/camunda/apache-tomcat-10.1.43/bin/shutdown.sh
+
+Restart=on-failure
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Nếu server chỉ có RAM 4 GB, nên dùng heap nhỏ hơn:
+
+```ini
+Environment=JAVA_OPTS=-Xms512m -Xmx2g -XX:+UseG1GC -Djava.awt.headless=true
+```
+
+Reload và start service:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now camunda
+sudo systemctl status camunda
+```
+
+Xem log service:
+
+```bash
+sudo journalctl -u camunda -f
+```
+
+Xem log Tomcat:
+
+```bash
+tail -f /opt/camunda/apache-tomcat-10.1.43/logs/catalina.out
+```
+
+## 6.1. Sửa lỗi H2 không tạo được thư mục `/camunda-h2-dbs`
+
+Nếu sau khi start service thấy Camunda tự thoát, `systemctl status camunda` báo `inactive (dead)` và log có lỗi:
+
+```text
+AccessDeniedException: /camunda-h2-dbs
+Error while creating file "/camunda-h2-dbs"
+```
+
+Nguyên nhân là datasource H2 mặc định cố tạo database ở thư mục gốc `/camunda-h2-dbs`, nhưng user `camunda` không có quyền tạo thư mục trực tiếp dưới `/`.
+
+Cách xử lý nhanh cho môi trường tạm H2:
+
+```bash
+sudo mkdir -p /camunda-h2-dbs
+sudo chown -R camunda:camunda /camunda-h2-dbs
+sudo chmod 750 /camunda-h2-dbs
+```
+
+Restart và kiểm tra:
+
+```bash
+sudo systemctl restart camunda
+sleep 10
+sudo systemctl status camunda --no-pager
+ss -lntp | grep 8080
+curl -I http://localhost:8080/camunda
+```
+
+Khi chuyển sang Oracle, thư mục H2 này không còn quan trọng nữa.
+
+## 7. Cấu hình Nginx reverse proxy
+
+Mục tiêu:
+
+```text
+Client -> Nginx port 80/443 -> Tomcat localhost:8080
+```
+
+Tạo file cấu hình Nginx:
+
+```bash
+sudo vim /etc/nginx/conf.d/camunda.conf
+```
+
+Nội dung HTTP ban đầu:
+
+```nginx
+server {
+    listen 80;
+    server_name _;
+
+    client_max_body_size 50m;
+
+    location / {
+        proxy_pass http://127.0.0.1:8080;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+    }
+}
+```
+
+Kiểm tra cấu hình:
+
+```bash
+sudo nginx -t
+```
+
+Start Nginx:
+
+```bash
+sudo systemctl start nginx
+sudo systemctl status nginx
+```
+
+Mở port 80:
+
+```bash
+sudo firewall-cmd --add-service=http --permanent
+sudo firewall-cmd --reload
+```
+
+Truy cập:
+
+```text
+http://<IP_SERVER_1>/camunda
+```
+
+Khi đã dùng Nginx, nên đóng port 8080 với bên ngoài:
+
+```bash
+sudo firewall-cmd --remove-port=8080/tcp --permanent
+sudo firewall-cmd --reload
+```
+
+Tomcat vẫn chạy `localhost:8080`, client chỉ truy cập qua Nginx.
+
+## 8. Cấu hình Tomcat nhận reverse proxy
+
+Mở file `server.xml`:
+
+```bash
+sudo vim /opt/camunda/apache-tomcat-10.1.43/conf/server.xml
+```
+
+Tìm connector port `8080`, ví dụ:
+
+```xml
+<Connector port="8080" protocol="HTTP/1.1"
+           connectionTimeout="20000"
+           redirectPort="8443" />
+```
+
+Chỉnh thành:
+
+```xml
+<Connector port="8080" protocol="HTTP/1.1"
+           address="127.0.0.1"
+           connectionTimeout="20000"
+           redirectPort="8443"
+           proxyName="<DOMAIN_OR_IP>"
+           proxyPort="80"
+           scheme="http" />
+```
+
+Nếu chưa có domain, có thể để tạm IP server ở `proxyName`.
+
+Restart Camunda:
+
+```bash
+sudo systemctl restart camunda
+```
+
+## 9. Cấu hình HTTPS nếu có domain
+
+Nếu có domain trỏ về Server 1, ví dụ:
+
+```text
+camunda.company.com
+```
+
+Cài Certbot:
+
+```bash
+sudo dnf install -y certbot python3-certbot-nginx
+```
+
+Xin certificate:
+
+```bash
+sudo certbot --nginx -d camunda.company.com
+```
+
+Mở HTTPS:
+
+```bash
+sudo firewall-cmd --add-service=https --permanent
+sudo firewall-cmd --reload
+```
+
+Khi dùng HTTPS, sửa Tomcat connector:
+
+```xml
+<Connector port="8080" protocol="HTTP/1.1"
+           address="127.0.0.1"
+           connectionTimeout="20000"
+           redirectPort="8443"
+           proxyName="camunda.company.com"
+           proxyPort="443"
+           scheme="https"
+           secure="true" />
+```
+
+Restart service:
+
+```bash
+sudo systemctl restart camunda
+sudo systemctl reload nginx
+```
+
+## 10. Hardening cơ bản cho production
+
+Tomcat chỉ listen local:
+
+```xml
+address="127.0.0.1"
+```
+
+Không mở port 8080 public:
+
+```bash
+sudo firewall-cmd --list-all
+```
+
+Kỳ vọng chỉ có:
+
+```text
+services: http https ssh
+```
+
+Không nên có:
+
+```text
+ports: 8080/tcp
+```
+
+Đặt timezone:
+
+```bash
+timedatectl
+sudo timedatectl set-timezone Asia/Ho_Chi_Minh
+timedatectl
+```
+
+## 11. Cấu hình log rotation
+
+Tạo file logrotate cho Tomcat:
+
+```bash
+sudo vim /etc/logrotate.d/camunda-tomcat
+```
+
+Nội dung:
+
+```text
+/opt/camunda/apache-tomcat-10.1.43/logs/*.log
+/opt/camunda/apache-tomcat-10.1.43/logs/*.out
+/opt/camunda/apache-tomcat-10.1.43/logs/*.txt {
+    daily
+    rotate 14
+    compress
+    missingok
+    notifempty
+    copytruncate
+}
+```
+
+Test logrotate:
+
+```bash
+sudo logrotate -d /etc/logrotate.d/camunda-tomcat
+```
+
+## 11.1. Vị trí log và truy cập bằng SFTP
+
+Với bản Tomcat `.tar.gz` bundled trong Camunda, log mặc định nằm trong thư mục Tomcat:
+
+```text
+/opt/camunda/apache-tomcat-10.1.43/logs
+```
+
+Các file log thường gặp:
+
+```text
+catalina.out
+catalina.YYYY-MM-DD.log
+localhost.YYYY-MM-DD.log
+localhost_access_log.YYYY-MM-DD.txt
+```
+
+Nếu muốn có đường dẫn quen thuộc dưới `/var/log`, tạo symlink:
+
+```bash
+sudo ln -s /opt/camunda/apache-tomcat-10.1.43/logs /var/log/camunda
+```
+
+Sau đó có thể xem log bằng:
+
+```bash
+ls -lah /var/log/camunda
+tail -f /var/log/camunda/catalina.out
+```
+
+Nếu SFTP trong Termius không thấy thư mục con trong `/opt/camunda`, nguyên nhân thường là quyền `/opt/camunda` đang là `700`. Mở quyền đọc/thấy thư mục:
+
+```bash
+sudo chmod 755 /opt/camunda
+sudo chmod 755 /opt/camunda/apache-tomcat-10.1.43
+sudo chmod 755 /opt/camunda/apache-tomcat-10.1.43/logs
+sudo chmod 644 /opt/camunda/apache-tomcat-10.1.43/logs/*
+```
+
+Nếu không muốn mở quyền thư mục cài đặt, có thể copy log ra `/tmp` để tải bằng SFTP:
+
+```bash
+sudo cp /opt/camunda/apache-tomcat-10.1.43/logs/catalina.out /tmp/catalina.out
+sudo chmod 644 /tmp/catalina.out
+```
+
+## 12. Kiểm tra vận hành
+
+Kiểm tra service:
+
+```bash
+sudo systemctl status camunda
+sudo systemctl status nginx
+```
+
+Kiểm tra port:
+
+```bash
+ss -lntp
+```
+
+Kỳ vọng:
+
+```text
+Nginx listen 0.0.0.0:80 hoặc 443
+Tomcat listen 127.0.0.1:8080
+```
+
+Kiểm tra URL:
+
+```text
+http://<IP_SERVER_1>/camunda
+http://<IP_SERVER_1>/engine-rest/engine
+```
+
+Nếu có HTTPS:
+
+```text
+https://camunda.company.com/camunda
+https://camunda.company.com/engine-rest/engine
+```
+
+Test restart:
+
+```bash
+sudo systemctl restart camunda
+sudo systemctl restart nginx
+```
+
+Test reboot:
+
+```bash
+sudo reboot
+```
+
+Sau khi server lên lại:
+
+```bash
+sudo systemctl status camunda
+sudo systemctl status nginx
+curl -I http://localhost:8080/camunda
+```
+
+## 13. Khi Oracle DB sẵn sàng
+
+Trên Server 1 cần làm:
+
+1. Copy Oracle JDBC driver vào Tomcat lib.
+2. Backup `server.xml` và `bpm-platform.xml`.
+3. Đổi datasource từ H2 sang Oracle.
+4. Restart Camunda.
+5. Kiểm tra bảng `ACT_*` trong Oracle.
+
+Ví dụ copy driver:
+
+```bash
+sudo cp ojdbc11.jar /opt/camunda/apache-tomcat-10.1.43/lib/
+sudo chown camunda:camunda /opt/camunda/apache-tomcat-10.1.43/lib/ojdbc11.jar
+```
+
+Dừng Camunda:
+
+```bash
+sudo systemctl stop camunda
+```
+
+Backup config:
+
+```bash
+sudo cp /opt/camunda/apache-tomcat-10.1.43/conf/server.xml /opt/camunda/apache-tomcat-10.1.43/conf/server.xml.bak
+sudo cp /opt/camunda/apache-tomcat-10.1.43/conf/bpm-platform.xml /opt/camunda/apache-tomcat-10.1.43/conf/bpm-platform.xml.bak
+```
+
+Datasource Oracle mẫu trong `server.xml`:
+
+```xml
+<Resource name="jdbc/ProcessEngine"
+          auth="Container"
+          type="javax.sql.DataSource"
+          factory="org.apache.tomcat.jdbc.pool.DataSourceFactory"
+          uniqueResourceName="process-engine"
+          driverClassName="oracle.jdbc.OracleDriver"
+          url="jdbc:oracle:thin:@//<ORACLE_HOST>:1521/<SERVICE_NAME>"
+          username="CAMUNDA"
+          password="StrongPasswordHere"
+          defaultTransactionIsolation="READ_COMMITTED"
+          maxActive="20"
+          minIdle="5"
+          maxIdle="20"
+          testOnBorrow="true"
+          validationQuery="SELECT 1 FROM DUAL" />
+```
+
+Start lại:
+
+```bash
+sudo systemctl start camunda
+sudo journalctl -u camunda -f
+```
+
+## 14. Tóm tắt thứ tự triển khai Server 1
+
+1. Cài Rocky 9, Java 17, Nginx, firewalld.
+2. Tạo user `camunda`.
+3. Tải Camunda 7.24 Tomcat distribution.
+4. Chạy thử bằng H2.
+5. Tạo `systemd` service.
+6. Đưa Nginx đứng trước Tomcat.
+7. Cấu hình Tomcat chỉ listen `localhost:8080`.
+8. Public port 80/443, không public 8080.
+9. Cấu hình logrotate, timezone, reboot test.
+10. Sau này đổi datasource sang Oracle.
+
+## 15. Kết luận
+
+Với production thật, điểm quan trọng nhất trên Server 1 là:
+
+```text
+Camunda chạy bằng user riêng
+Tomcat không public trực tiếp
+Nginx xử lý HTTP/HTTPS
+Port 8080 chỉ listen localhost
+Log có rotation
+Service tự start sau reboot
+```
