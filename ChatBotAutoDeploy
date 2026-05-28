@@ -1,0 +1,1400 @@
+# Teams Bot tự động Deploy trên Rocky 9 — Tài liệu đầy đủ
+
+Tài liệu này bao gồm toàn bộ nội dung từ kiến trúc, quy trình xử lý, cho đến hướng dẫn cài đặt từng bước cụ thể (copy-paste chạy trực tiếp) để xây dựng hệ thống tự động triển khai ứng dụng thông qua Microsoft Teams Bot và Deploy API trên máy chủ Rocky Linux 9.
+
+---
+
+# PHẦN 1: TỔNG QUAN VÀ KIẾN TRÚC
+
+---
+
+## 1.1. Mục tiêu
+
+Xây dựng một Chatbot trong Microsoft Teams có khả năng:
+* Nhận lệnh chat trực tiếp hoặc từ các nhóm/kênh (group/channel) trên Teams.
+* Gửi thông báo xác nhận vào nhóm/kênh: *"Ứng dụng [Target] sẽ được deploy sau 2 phút"*.
+* Trì hoãn 2 phút (chờ 120 giây) để thành viên dự án có thời gian hủy lệnh nếu cần thiết.
+* Tự động kéo mã nguồn mới nhất từ Git trên máy chủ Rocky 9.
+* Triển khai lại API và Website bằng Docker Compose.
+* Gửi thông báo kết quả (thành công hoặc thất bại kèm chi tiết) trở lại Teams.
+
+> [!IMPORTANT]
+> **Lưu ý đặc biệt về công nghệ triển khai:**
+> Hệ thống này sử dụng **Docker** và **Docker Compose** làm nền tảng cốt lõi để đóng gói và vận hành dịch vụ (API & Website). Do đó, máy chủ Rocky 9 bắt buộc phải được cài đặt sẵn Docker Engine và Docker Compose plugin. Tất cả các lệnh khởi chạy, build image mới và khởi động lại dịch vụ đều được điều khiển thông qua cấu hình `docker-compose.yml` trong thư mục mã nguồn.
+
+**Ví dụ câu lệnh trên Teams:**
+```text
+@DeployBot deploy all
+@DeployBot deploy api
+@DeployBot deploy website
+```
+
+---
+
+## 1.2. Kiến trúc tổng thể
+
+```text
+Microsoft Teams Channel / Group Chat
+        |
+        | Lệnh: @DeployBot deploy all
+        v
+Microsoft Teams Bot Service (Node.js)
+        |
+        | POST /deploy (Kèm Secret Token trong Authorization Header)
+        v
+Deploy API trên Rocky 9 (Chạy dưới dạng systemd service bằng user 'deploy')
+        |
+        | Gọi Shell Script cố định bằng child_process.spawn
+        v
+Shell Script (/opt/deploy/deploy.sh)
+        |
+        | Git fetch & reset + Docker Compose build & up
+        v
+API Container + Website Container
+        |
+        | Trả kết quả (Exit Code, Commit Hash, Log File...)
+        v
+Bot báo lại Teams: Deploy hoàn tất (Thành công/Thất bại)
+```
+
+---
+
+## 1.3. Các thành phần cần thiết
+
+### 1.3.1. Microsoft Teams Bot
+Bot chạy trên một nền tảng cloud (hoặc VPS riêng) có nhiệm vụ:
+* Nhận sự kiện tin nhắn khi người dùng `@mention` bot trong nhóm hoặc chat trực tiếp.
+* Kiểm tra tính hợp lệ của câu lệnh (Validate command).
+* Kiểm tra danh sách người dùng được phép kích hoạt deploy (Whitelist).
+* Gửi tin nhắn cảnh báo sắp triển khai và thiết lập bộ hẹn giờ hoãn 120 giây.
+* Cho phép hủy lệnh trong thời gian chờ bằng lệnh `@DeployBot cancel`.
+* Hết thời gian chờ, gọi HTTPS POST tới **Deploy API** trên server Rocky 9.
+* Nhận phản hồi từ Deploy API và gửi thông báo kết quả trực quan về nhóm/kênh.
+
+> [!NOTE]
+> Để nhận được tin nhắn trong nhóm/kênh, Bot phải được đăng ký cấu hình đầy đủ trong Azure Bot Service, cài đặt ứng dụng vào Kênh (Channel) hoặc Nhóm chat, và bắt buộc phải dùng cú pháp `@mention`.
+
+### 1.3.2. Deploy API trên Rocky 9
+Một ứng dụng Node.js gọn nhẹ đóng vai trò làm API nhận yêu cầu từ Teams Bot.
+* **Xác thực bảo mật**: Kiểm tra Bearer Token khớp với mã bí mật cấu hình trên server.
+* **Kiểm soát tham số**: Chỉ cho phép các hành động nằm trong danh mục: `api`, `website`, `all`.
+* **Tránh xung đột (Locking)**: Sử dụng cơ chế lock file để đảm bảo không có 2 phiên deploy chạy song song.
+* **Thực thi an toàn**: Gọi Shell Script cố định thông qua Node.js `spawn` không sử dụng shell truyền trực tiếp tham số tùy ý của người dùng để tránh lỗ hổng Command Injection.
+* **Ghi nhật ký (Logs)**: Ghi lại toàn bộ tiến trình stdout/stderr của Shell Script vào thư mục log riêng biệt.
+* **Phản hồi chi tiết**: Trả về trạng thái HTTP phù hợp (200 OK nếu thành công, 409 Conflict nếu đang bận deploy, 500 Internal Server Error nếu lỗi build/run).
+
+### 1.3.3. Shell Script triển khai trên Rocky 9 (`deploy.sh`)
+Shell script được thiết kế để chỉ chạy các tác vụ định sẵn:
+1. Di chuyển vào thư mục dự án tương ứng.
+2. Lấy mã nguồn mới nhất từ remote Git (`git fetch origin`).
+3. Khôi phục trạng thái làm việc sạch và trỏ về đúng nhánh cấu hình (`git reset --hard origin/main`).
+4. Build lại Docker image cho service được chỉ định.
+5. Khởi động lại các container tương ứng (`docker compose up -d`).
+6. Kiểm tra trạng thái hoạt động của container và lấy Commit Hash mới nhất để phản hồi.
+
+---
+
+## 1.4. Quy trình xử lý chi tiết
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor User as User (Whitelist)
+    participant Bot as Teams Bot
+    participant API as Deploy API (Rocky 9)
+    participant Script as Shell Script
+
+    User->>Bot: @DeployBot deploy all
+    Note over Bot: Kiểm tra quyền & Cú pháp lệnh
+    alt Lệnh hợp lệ & User nằm trong whitelist
+        Bot-->>User: Thông báo: "Deploy sẽ bắt đầu sau 2 phút..."
+        Note over Bot: Đợi 120 giây (Hỗ trợ hủy lệnh)
+        alt Hết 120s và không bị hủy
+            Bot->>API: POST /deploy (Bearer Token, target: "all")
+            Note over API: Kiểm tra Lock File
+            alt Lock File đã tồn tại
+                API-->>Bot: Trả về HTTP 409 (Đang bận deploy)
+                Bot-->>User: Thông báo: "Không thể deploy vì đang có phiên khác chạy!"
+            else Lock File trống
+                API->>Script: Thực thi deploy.sh all
+                activate Script
+                Note over Script: git fetch && git reset --hard<br/>docker compose build && up
+                Script-->>API: Hoàn tất (Exit code: 0 hoặc khác 0)
+                deactivate Script
+                alt Deploy thành công (Exit 0)
+                    API-->>Bot: Trả về HTTP 200 (Commit hash, Thời gian)
+                    Bot-->>User: Thông báo: "Deploy DONE! Commit: abc1234 (95s)"
+                else Deploy thất bại (Exit khác 0)
+                    API-->>Bot: Trả về HTTP 500 (Lỗi chi tiết, Đường dẫn log)
+                    Bot-->>User: Thông báo: "Deploy FAILED! Vui lòng kiểm tra log..."
+                end
+            end
+        else Người dùng gõ "@DeployBot cancel"
+            User->>Bot: @DeployBot cancel
+            Bot-->>User: Thông báo: "Lệnh deploy đã được hủy bỏ thành công"
+        end
+    else Không hợp lệ
+        Bot-->>User: Phản hồi từ chối hoặc hướng dẫn cú pháp
+    end
+```
+
+### Chi tiết các bước xử lý:
+
+* **Bước 1 (User gửi yêu cầu)**: Thành viên dự án gõ tin nhắn `@DeployBot deploy all` vào nhóm.
+* **Bước 2 (Bot kiểm tra cú pháp)**: Bot lọc bỏ phần `@mention` và so khớp cú pháp. Chỉ chấp nhận các câu lệnh: `deploy api`, `deploy website`, `deploy all`, `status`, `cancel`. Nếu sai cú pháp, trả về hướng dẫn sử dụng.
+* **Bước 3 (Bot kiểm tra quyền hạn)**: Bot kiểm tra Email/ID người gửi có khớp với danh sách Whitelist cấu hình sẵn không.
+  * *Ví dụ Whitelist:* `["admin@example.com", "devops@example.com", "techlead@example.com"]`
+* **Bước 4 (Thông báo chuẩn bị triển khai)**: Nếu hợp lệ, Bot gửi tin nhắn vào nhóm:
+  > **[Thông báo]** Lệnh `deploy all` sẽ tự động bắt đầu sau 2 phút.
+  > * Người yêu cầu: `admin@example.com`
+  > * Vui lòng tạm dừng các thao tác thử nghiệm trên môi trường production.
+* **Bước 5 (Trì hoãn 120 giây)**: Bot thiết lập một bộ đệm thời gian 2 phút. Trong thời gian này, nếu nhận được tin nhắn hợp lệ `@DeployBot cancel`, hệ thống sẽ hủy lịch hẹn triển khai và báo: *"Lệnh deploy đã được hủy bỏ"*.
+* **Bước 6 (Gọi Deploy API)**: Sau 120 giây, nếu không bị hủy, Bot gửi POST HTTP Request tới server Rocky 9.
+* **Bước 7 (API kiểm tra lock)**: Deploy API nhận request, kiểm tra sự tồn tại của file khóa (Lock file) để ngăn chặn việc chạy nhiều tiến trình deploy cùng một lúc làm quá tải tài nguyên máy chủ.
+* **Bước 8 & 9 (API thực thi Script)**: API kích hoạt script `/opt/deploy/deploy.sh` chạy dưới dạng một tiến trình con (child process). Script thực hiện kéo mã nguồn mới, build lại Docker container và ghi lại nhật ký.
+* **Bước 10 & 11 (Trả kết quả và thông báo)**: API nhận mã thoát (exit code) từ script. Trả kết quả dạng JSON về cho Bot. Bot dựa vào kết quả để định dạng tin nhắn gửi lại nhóm Teams thông báo tình trạng.
+
+---
+
+## 1.5. Tổng quan các bước setup và thời gian ước tính
+
+```mermaid
+flowchart LR
+    A["Bước 1<br/>Chuẩn bị Server Rocky 9"] --> B["Bước 2<br/>Tạo user & phân quyền"]
+    B --> C["Bước 3<br/>Tạo Deploy Script"]
+    C --> D["Bước 4<br/>Cài Deploy API (Node.js)"]
+    D --> E["Bước 5<br/>Đăng ký Teams Bot trên Azure"]
+    E --> F["Bước 6<br/>Viết code Bot"]
+    F --> G["Bước 7<br/>Test toàn bộ"]
+```
+
+| Bước | Ở đâu | Làm gì | Thời gian ước tính |
+|------|--------|--------|-------------------|
+| 1 | Server Rocky 9 | Cài Docker, Git, Node.js | 15 phút |
+| 2 | Server Rocky 9 | Tạo user `deploy`, phân quyền | 5 phút |
+| 3 | Server Rocky 9 | Tạo shell script deploy | 10 phút |
+| 4 | Server Rocky 9 | Cài Deploy API (Express.js) | 15 phút |
+| 5 | Trình duyệt (Azure Portal) | Đăng ký Bot trên Azure | 20 phút |
+| 6 | Máy tính cá nhân hoặc Server | Viết code xử lý Bot | 30 phút |
+| 7 | Teams + Server | Test từng phần rồi test tổng | 20 phút |
+
+---
+
+# PHẦN 2: HƯỚNG DẪN SETUP TRÊN SERVER ROCKY 9
+
+Toàn bộ thao tác trong phần này được thực hiện qua SSH vào server Rocky 9.
+
+---
+
+## Bước 1: Cài đặt phần mềm cần thiết trên Rocky 9
+
+### 1.1. Cài Docker Engine
+
+> [!IMPORTANT]
+> Hệ thống deploy sử dụng Docker và Docker Compose để đóng gói và chạy ứng dụng. Đây là thành phần **bắt buộc** phải cài trước.
+
+```bash
+# Xóa các phiên bản Docker cũ (nếu có)
+sudo dnf remove -y docker docker-client docker-client-latest \
+  docker-common docker-latest docker-latest-logrotate \
+  docker-logrotate docker-engine
+
+# Thêm Docker repository chính thức
+sudo dnf install -y dnf-plugins-core
+sudo dnf config-manager --add-repo https://download.docker.com/linux/centos/docker-ce.repo
+
+# Cài Docker Engine + Docker Compose plugin
+sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+
+# Khởi động Docker và bật tự chạy khi boot
+sudo systemctl start docker
+sudo systemctl enable docker
+
+# Kiểm tra Docker đã chạy OK
+sudo docker version
+sudo docker compose version
+```
+
+**Kết quả mong đợi:** Hiển thị phiên bản Docker (ví dụ `Docker version 24.x`) và Docker Compose (ví dụ `Docker Compose version v2.x`).
+
+### 1.2. Cài Git
+
+```bash
+sudo dnf install -y git
+
+# Kiểm tra
+git --version
+```
+
+### 1.3. Cài Node.js (cho Deploy API)
+
+```bash
+# Cài Node.js 20 LTS từ NodeSource
+curl -fsSL https://rpm.nodesource.com/setup_20.x | sudo bash -
+sudo dnf install -y nodejs
+
+# Kiểm tra
+node --version   # Mong đợi: v20.x.x
+npm --version
+```
+
+---
+
+## Bước 2: Tạo user `deploy` và phân quyền
+
+> [!WARNING]
+> **Không bao giờ** chạy Deploy API hay deploy script bằng user `root` trên production. Luôn dùng user riêng biệt.
+
+### 2.1. Tạo user hệ thống
+
+```bash
+# Tạo user deploy (không có password đăng nhập, chỉ dùng nội bộ)
+sudo useradd --system --create-home --shell /bin/bash deploy
+```
+
+### 2.2. Cho user deploy quyền chạy Docker
+
+```bash
+# Thêm user deploy vào nhóm docker
+sudo usermod -aG docker deploy
+
+# Kiểm tra: chạy thử docker bằng user deploy
+sudo -u deploy docker ps
+```
+
+**Kết quả mong đợi:** Không báo lỗi "permission denied", hiển thị danh sách container (có thể trống).
+
+### 2.3. Tạo các thư mục cần thiết
+
+```bash
+# Thư mục chứa shell script deploy
+sudo mkdir -p /opt/deploy
+
+# Thư mục chứa mã nguồn ứng dụng (nơi đặt docker-compose.yml)
+sudo mkdir -p /opt/apps/my-app
+
+# Thư mục chứa Deploy API (Node.js)
+sudo mkdir -p /opt/deploy-api
+
+# Thư mục chứa log deploy
+sudo mkdir -p /var/log/my-app
+
+# Gán toàn bộ quyền sở hữu cho user deploy
+sudo chown -R deploy:deploy /opt/deploy
+sudo chown -R deploy:deploy /opt/apps/my-app
+sudo chown -R deploy:deploy /opt/deploy-api
+sudo chown -R deploy:deploy /var/log/my-app
+```
+
+### 2.4. Cấu hình Git Deploy Key (để pull code từ GitHub/GitLab)
+
+```bash
+# Chuyển sang user deploy
+sudo su - deploy
+
+# Tạo SSH key riêng cho deploy (không đặt passphrase, nhấn Enter 3 lần)
+ssh-keygen -t ed25519 -C "deploy@my-server" -f ~/.ssh/deploy_key
+
+# Xem public key để copy lên GitHub/GitLab
+cat ~/.ssh/deploy_key.pub
+```
+
+> [!TIP]
+> **Copy nội dung public key** ở trên rồi làm theo bước dưới:
+> - **GitHub**: Vào repo → Settings → Deploy keys → Add deploy key → Paste key → **KHÔNG** tick "Allow write access"
+> - **GitLab**: Vào repo → Settings → Repository → Deploy Keys → Paste key → **KHÔNG** tick "Write"
+
+Cấu hình SSH để tự động dùng key này khi connect:
+
+```bash
+# Vẫn đang ở user deploy
+cat > ~/.ssh/config << 'EOF'
+Host github.com
+  HostName github.com
+  User git
+  IdentityFile ~/.ssh/deploy_key
+  IdentitiesOnly yes
+
+Host gitlab.com
+  HostName gitlab.com
+  User git
+  IdentityFile ~/.ssh/deploy_key
+  IdentitiesOnly yes
+EOF
+
+chmod 600 ~/.ssh/config
+chmod 600 ~/.ssh/deploy_key
+```
+
+### 2.5. Clone mã nguồn ứng dụng lần đầu
+
+```bash
+# Vẫn đang ở user deploy
+cd /opt/apps/my-app
+
+# Clone repo (thay URL bằng repo thật của bạn)
+git clone git@github.com:your-org/your-app.git .
+
+# Kiểm tra
+git log --oneline -3
+```
+
+> [!IMPORTANT]
+> Thư mục `/opt/apps/my-app` phải chứa file `docker-compose.yml` (hoặc `compose.yml`) định nghĩa các service `api` và `website`. Nếu repo của bạn đặt file này ở thư mục con thì cần điều chỉnh biến `APP_DIR` trong script deploy.
+
+Thoát khỏi user deploy:
+```bash
+exit
+```
+
+---
+
+## Bước 3: Tạo Shell Script Deploy
+
+> [!WARNING]
+> Lock file không nên đặt trực tiếp tại `/var/lock/` vì thư mục này mặc định chỉ cho phép `root` thao tác, gây ra lỗi **Permission Denied** khi chạy bằng user thường. Script dưới đây sử dụng `/tmp/my-app-deploy.lock`.
+
+### 3.1. Tạo file script
+
+```bash
+sudo -u deploy nano /opt/deploy/deploy.sh
+```
+
+Paste toàn bộ nội dung sau vào:
+
+```bash
+#!/usr/bin/env bash
+# ==============================================================================
+# Script tự động deploy ứng dụng - Chạy bởi user 'deploy'
+# Sử dụng Docker Compose để build và khởi động lại container
+# ==============================================================================
+set -euo pipefail
+
+TARGET="${1:-all}"
+APP_DIR="/opt/apps/my-app"            # <-- Đổi thành đường dẫn repo thực tế của bạn
+BRANCH="main"                         # <-- Đổi thành branch bạn muốn deploy
+LOG_DIR="/var/log/my-app"
+LOCK_FILE="/tmp/my-app-deploy.lock"
+NOW="$(date +%Y%m%d-%H%M%S)"
+LOG_FILE="$LOG_DIR/deploy-$NOW.log"
+
+# Ghi log ra cả file lẫn terminal
+exec > >(tee -a "$LOG_FILE") 2>&1
+
+echo "===== BẮT ĐẦU DEPLOY ====="
+echo "Thời gian: $(date -Is)"
+echo "Dịch vụ: $TARGET"
+echo "Thư mục: $APP_DIR"
+echo "Nhánh: $BRANCH"
+
+# --- Kiểm tra Lock ---
+if [ -f "$LOCK_FILE" ]; then
+  echo "LỖI: Một tiến trình deploy khác đang chạy!"
+  exit 20
+fi
+
+cleanup() {
+  echo "Đang dọn dẹp file khóa..."
+  rm -f "$LOCK_FILE"
+}
+trap cleanup EXIT
+touch "$LOCK_FILE"
+
+# --- Kiểm tra thư mục ---
+if [ ! -d "$APP_DIR" ]; then
+  echo "LỖI: Thư mục $APP_DIR không tồn tại!"
+  exit 15
+fi
+cd "$APP_DIR"
+
+# --- Lưu commit cũ để rollback ---
+PREVIOUS_COMMIT="$(git rev-parse --short HEAD || echo 'unknown')"
+echo "Commit hiện tại (trước deploy): $PREVIOUS_COMMIT"
+
+# --- Pull code mới ---
+echo "Đang kéo code mới từ Git..."
+git fetch origin "$BRANCH"
+git reset --hard "origin/$BRANCH"
+
+NEW_COMMIT="$(git rev-parse --short HEAD)"
+echo "Commit mới (sau deploy): $NEW_COMMIT"
+
+# --- Build & Deploy bằng Docker Compose ---
+case "$TARGET" in
+  api)
+    echo "Đang build và khởi động lại API..."
+    docker compose build api
+    docker compose up -d api
+    ;;
+  website)
+    echo "Đang build và khởi động lại Website..."
+    docker compose build website
+    docker compose up -d website
+    ;;
+  all)
+    echo "Đang build và khởi động lại toàn bộ hệ thống..."
+    docker compose build
+    docker compose up -d
+    ;;
+  *)
+    echo "LỖI: Target không hợp lệ: $TARGET"
+    exit 10
+    ;;
+esac
+
+echo "Trạng thái Docker container:"
+docker compose ps
+
+echo "===== DEPLOY HOÀN TẤT ====="
+echo "Commit: $NEW_COMMIT"
+echo "Log: $LOG_FILE"
+```
+
+### 3.2. Cấp quyền thực thi
+
+```bash
+chmod +x /opt/deploy/deploy.sh
+```
+
+### 3.3. Test thử script bằng tay
+
+```bash
+# Chạy thử bằng user deploy
+sudo -u deploy /opt/deploy/deploy.sh all
+```
+
+**Kết quả mong đợi:** Script kéo code mới, build Docker image, khởi động container, in ra commit hash và trạng thái container.
+
+> [!CAUTION]
+> Nếu gặp lỗi, kiểm tra:
+> - `Permission denied` → Kiểm tra lại quyền sở hữu thư mục (`chown`)
+> - `docker: permission denied` → User deploy chưa được thêm vào group docker
+> - `git: Permission denied (publickey)` → SSH deploy key chưa được cấu hình đúng
+> - `No such file or directory: docker-compose.yml` → File compose chưa có trong thư mục APP_DIR
+
+---
+
+## Bước 4: Cài đặt Deploy API (Node.js Express)
+
+Deploy API là một web server nhỏ chạy trên Rocky 9, có nhiệm vụ **nhận HTTP request từ Teams Bot** và **gọi shell script deploy**.
+
+### 4.1. Khởi tạo project Node.js
+
+```bash
+# Chuyển sang user deploy
+sudo su - deploy
+cd /opt/deploy-api
+
+# Khởi tạo package.json
+npm init -y
+
+# Cài Express và dotenv
+npm install express dotenv
+```
+
+### 4.2. Tạo file cấu hình môi trường
+
+```bash
+cat > /opt/deploy-api/.env << 'EOF'
+# Port mà Deploy API lắng nghe
+PORT=9000
+
+# Token bí mật - Teams Bot phải gửi đúng token này mới được phép deploy
+# ĐỔI THÀNH CHUỖI DÀI, KHÓ ĐOÁN, VÍ DỤ: openssl rand -hex 32
+DEPLOY_SECRET=doi-thanh-chuoi-bi-mat-cua-ban
+
+# Đường dẫn tới shell script deploy
+DEPLOY_SCRIPT=/opt/deploy/deploy.sh
+EOF
+```
+
+> [!WARNING]
+> **Bắt buộc** phải đổi giá trị `DEPLOY_SECRET` thành một chuỗi ngẫu nhiên dài. Tạo nhanh bằng lệnh:
+> ```bash
+> openssl rand -hex 32
+> ```
+> Ví dụ kết quả: `a1b2c3d4e5f6...` (64 ký tự hex). Copy chuỗi đó paste vào thay thế `doi-thanh-chuoi-bi-mat-cua-ban`.
+
+### 4.3. Tạo file server chính `/opt/deploy-api/server.js`
+
+```bash
+cat > /opt/deploy-api/server.js << 'ENDOFFILE'
+require("dotenv").config();
+const express = require("express");
+const { spawn } = require("child_process");
+
+const app = express();
+app.use(express.json());
+
+const port = Number(process.env.PORT || 9000);
+const deploySecret = process.env.DEPLOY_SECRET;
+const deployScript = process.env.DEPLOY_SCRIPT || "/opt/deploy/deploy.sh";
+const allowedTargets = new Set(["api", "website", "all"]);
+
+// Endpoint kiểm tra API có sống không
+app.get("/health", (req, res) => {
+  res.json({ ok: true, message: "Deploy API is running" });
+});
+
+// Endpoint nhận lệnh deploy
+app.post("/deploy", (req, res) => {
+  // 1. Kiểm tra Bearer Token
+  const auth = req.headers.authorization || "";
+  const token = auth.replace(/^Bearer\s+/i, "").trim();
+
+  if (!deploySecret || token !== deploySecret) {
+    console.log(`[${new Date().toISOString()}] Từ chối: Sai token`);
+    return res.status(401).json({ ok: false, message: "Unauthorized" });
+  }
+
+  // 2. Kiểm tra target hợp lệ
+  const target = String(req.body.target || "").trim().toLowerCase();
+  if (!allowedTargets.has(target)) {
+    return res.status(400).json({
+      ok: false,
+      message: "Target không hợp lệ. Chỉ chấp nhận: api, website, all",
+    });
+  }
+
+  const requestedBy = String(req.body.requested_by || "unknown").trim();
+  console.log(`[${new Date().toISOString()}] Deploy [${target}] yêu cầu bởi: ${requestedBy}`);
+
+  // 3. Chạy script deploy (spawn không dùng shell: true để tránh injection)
+  const startedAt = Date.now();
+  const child = spawn(deployScript, [target], { shell: false });
+
+  let output = "";
+  child.stdout.on("data", (data) => { output += data.toString(); });
+  child.stderr.on("data", (data) => { output += data.toString(); });
+
+  child.on("close", (code) => {
+    const durationSeconds = Math.round((Date.now() - startedAt) / 1000);
+    const commitMatch = output.match(/Commit:\s*([a-f0-9]+)/i);
+    const commit = commitMatch ? commitMatch[1] : null;
+
+    // Thành công
+    if (code === 0) {
+      return res.json({
+        ok: true, target, commit,
+        duration_seconds: durationSeconds,
+        message: "Deploy thành công",
+      });
+    }
+
+    // Đang có deploy khác chạy (exit code 20)
+    if (code === 20) {
+      return res.status(409).json({
+        ok: false, target,
+        message: "Đang có một phiên deploy khác đang chạy. Vui lòng thử lại sau.",
+      });
+    }
+
+    // Lỗi khác
+    return res.status(500).json({
+      ok: false, target,
+      duration_seconds: durationSeconds,
+      message: "Deploy thất bại",
+      exit_code: code,
+    });
+  });
+});
+
+app.listen(port, () => {
+  console.log(`Deploy API đang chạy tại port ${port}`);
+});
+ENDOFFILE
+```
+
+### 4.4. Test Deploy API bằng tay
+
+```bash
+# Vẫn ở user deploy, chạy thử server
+cd /opt/deploy-api
+node server.js
+```
+
+Mở terminal khác, test bằng curl:
+
+```bash
+# Test health check
+curl http://localhost:9000/health
+
+# Test deploy (thay token bằng token thật của bạn)
+curl -X POST http://localhost:9000/deploy \
+  -H "Authorization: Bearer doi-thanh-chuoi-bi-mat-cua-ban" \
+  -H "Content-Type: application/json" \
+  -d '{"target":"all","requested_by":"test@example.com"}'
+```
+
+**Kết quả mong đợi:**
+```json
+{"ok":true,"target":"all","commit":"abc1234","duration_seconds":45,"message":"Deploy thành công"}
+```
+
+Nếu OK, nhấn `Ctrl+C` để tắt server test. Thoát user deploy:
+```bash
+exit
+```
+
+### 4.5. Cài Deploy API chạy như systemd service (chạy nền vĩnh viễn)
+
+```bash
+sudo cat > /etc/systemd/system/deploy-api.service << 'EOF'
+[Unit]
+Description=Deploy API Service cho Teams Bot
+After=network.target docker.service
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/deploy-api
+EnvironmentFile=/opt/deploy-api/.env
+ExecStart=/usr/bin/node /opt/deploy-api/server.js
+Restart=always
+RestartSec=5
+User=deploy
+Group=deploy
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Kích hoạt và khởi động service
+sudo systemctl daemon-reload
+sudo systemctl enable deploy-api
+sudo systemctl start deploy-api
+
+# Kiểm tra trạng thái
+sudo systemctl status deploy-api
+```
+
+**Kết quả mong đợi:** Hiển thị `Active: active (running)`.
+
+### 4.6. Mở firewall cho Deploy API (nếu cần truy cập từ bên ngoài)
+
+```bash
+# Mở port 9000 (hoặc port bạn chọn)
+sudo firewall-cmd --permanent --add-port=9000/tcp
+sudo firewall-cmd --reload
+```
+
+> [!TIP]
+> **Khuyến nghị mạnh**: Thay vì mở port 9000 trực tiếp ra internet, bạn nên dùng **Nginx làm Reverse Proxy** kèm **SSL/TLS (HTTPS)**. Xem phần cấu hình Nginx bên dưới.
+
+### 4.7. (Khuyến nghị) Cấu hình Nginx Reverse Proxy + HTTPS
+
+```bash
+# Cài Nginx
+sudo dnf install -y nginx
+
+# Cài Certbot để lấy chứng chỉ SSL miễn phí
+sudo dnf install -y certbot python3-certbot-nginx
+```
+
+Tạo cấu hình Nginx:
+
+```bash
+sudo cat > /etc/nginx/conf.d/deploy-api.conf << 'EOF'
+server {
+    listen 80;
+    server_name deploy.your-domain.com;    # <-- ĐỔI thành domain thật
+
+    location / {
+        proxy_pass http://127.0.0.1:9000;
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Timeout dài vì deploy có thể chạy vài phút
+        proxy_read_timeout 600s;
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 600s;
+    }
+}
+EOF
+
+# Kiểm tra cấu hình Nginx
+sudo nginx -t
+
+# Khởi động Nginx
+sudo systemctl enable nginx
+sudo systemctl start nginx
+
+# Lấy chứng chỉ SSL (thay domain thật)
+sudo certbot --nginx -d deploy.your-domain.com
+```
+
+Sau khi hoàn tất, Deploy API sẽ được truy cập qua: `https://deploy.your-domain.com/deploy`
+
+---
+
+# PHẦN 3: ĐĂNG KÝ VÀ CÀI ĐẶT TEAMS BOT
+
+Đây là phần phức tạp nhất vì phải thao tác trên nhiều nơi: Azure Portal, Teams Admin, và viết code.
+
+---
+
+## Bước 5: Đăng ký Bot trên Azure Portal
+
+### 5.1. Tạo Azure Bot Resource
+
+> [!NOTE]
+> Bạn cần có tài khoản Microsoft Azure (có thể dùng gói miễn phí Free Tier).
+
+**Thao tác trên trình duyệt:**
+
+1. Truy cập: https://portal.azure.com
+2. Tìm kiếm **"Azure Bot"** trong thanh tìm kiếm → Click **Create**
+3. Điền thông tin:
+   - **Bot handle**: `DeployBot` (tên định danh, không trùng với bot khác)
+   - **Subscription**: Chọn subscription của bạn
+   - **Resource group**: Tạo mới hoặc chọn có sẵn
+   - **Pricing tier**: Chọn **F0 (Free)** — miễn phí, đủ dùng
+   - **Type of App**: Chọn **Multi Tenant**
+   - **Creation type**: Chọn **Create new Microsoft App ID**
+4. Click **Review + Create** → **Create**
+5. Đợi tạo xong → Click **Go to resource**
+
+### 5.2. Lấy App ID và Password
+
+1. Trong trang Azure Bot vừa tạo → Click **Configuration** (menu bên trái)
+2. Copy **Microsoft App ID** → Lưu lại (ví dụ: `xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx`)
+3. Click **Manage Password** → Click **New client secret**
+   - Description: `DeployBot Secret`
+   - Expires: Chọn thời hạn phù hợp (ví dụ: 24 months)
+   - Click **Add**
+4. **Copy ngay giá trị Secret** (chỉ hiển thị 1 lần!) → Lưu lại
+
+> [!CAUTION]
+> **Giá trị Client Secret chỉ hiển thị MỘT LẦN DUY NHẤT** sau khi tạo. Nếu bạn quên copy, phải tạo secret mới. Hãy lưu vào nơi an toàn ngay lập tức.
+
+### 5.3. Cấu hình Messaging Endpoint
+
+1. Quay lại trang **Configuration** của Azure Bot
+2. Ở ô **Messaging endpoint**, nhập URL mà Teams sẽ gọi tới Bot của bạn:
+   ```
+   https://your-bot-server.com/api/messages
+   ```
+   (Đây là URL nơi bạn sẽ chạy code Bot - xem Bước 6)
+3. Click **Apply**
+
+### 5.4. Kết nối Bot với Microsoft Teams
+
+1. Trong trang Azure Bot → Click **Channels** (menu bên trái)
+2. Click **Microsoft Teams** → Click **Apply** → **Save**
+3. Bây giờ Bot đã được kết nối với Teams
+
+### 5.5. Tạo file Manifest để cài Bot vào Teams
+
+Tạo thư mục trên máy tính cá nhân, tạo 3 file sau:
+
+**File `manifest.json`:**
+```json
+{
+  "$schema": "https://developer.microsoft.com/en-us/json-schemas/teams/v1.16/MicrosoftTeams.schema.json",
+  "manifestVersion": "1.16",
+  "version": "1.0.0",
+  "id": "THAY_BANG_MICROSOFT_APP_ID_CUA_BAN",
+  "developer": {
+    "name": "Your Company",
+    "websiteUrl": "https://your-domain.com",
+    "privacyUrl": "https://your-domain.com/privacy",
+    "termsOfUseUrl": "https://your-domain.com/terms"
+  },
+  "name": {
+    "short": "DeployBot",
+    "full": "Deploy Bot - Tự động triển khai"
+  },
+  "description": {
+    "short": "Bot hỗ trợ deploy ứng dụng qua Teams",
+    "full": "Bot cho phép các thành viên được ủy quyền kích hoạt triển khai API/Website thông qua lệnh chat trong Microsoft Teams."
+  },
+  "icons": {
+    "outline": "outline.png",
+    "color": "color.png"
+  },
+  "accentColor": "#0078D4",
+  "bots": [
+    {
+      "botId": "THAY_BANG_MICROSOFT_APP_ID_CUA_BAN",
+      "scopes": ["team", "groupChat", "personal"],
+      "commandLists": [
+        {
+          "scopes": ["team", "groupChat"],
+          "commands": [
+            { "title": "deploy api", "description": "Triển khai dịch vụ API" },
+            { "title": "deploy website", "description": "Triển khai dịch vụ Website" },
+            { "title": "deploy all", "description": "Triển khai toàn bộ hệ thống" },
+            { "title": "status", "description": "Kiểm tra trạng thái deploy" },
+            { "title": "cancel", "description": "Hủy lệnh deploy đang chờ" }
+          ]
+        }
+      ]
+    }
+  ],
+  "permissions": ["identity", "messageTeamMembers"],
+  "validDomains": ["your-bot-server.com"]
+}
+```
+
+> [!IMPORTANT]
+> Thay **tất cả** chỗ `THAY_BANG_MICROSOFT_APP_ID_CUA_BAN` bằng App ID bạn đã copy ở bước 5.2.
+
+**File `color.png`**: Ảnh icon 192x192 pixel (màu, file PNG)
+**File `outline.png`**: Ảnh icon 32x32 pixel (outline trắng trên nền trong suốt)
+
+→ Bạn có thể dùng bất kỳ ảnh logo nào cắt đúng kích thước.
+
+Zip 3 file thành `DeployBot.zip`.
+
+### 5.6. Upload Bot vào Teams
+
+1. Mở Microsoft Teams
+2. Click **Apps** (thanh bên trái) → **Manage your apps** → **Upload an app**
+3. Chọn **Upload a custom app** → Chọn file `DeployBot.zip`
+4. Click **Add** → Chọn Team/Channel muốn cài bot vào
+5. Thử gõ `@DeployBot` trong channel → Nếu hiện gợi ý tên bot = **cài đặt thành công**
+
+> [!NOTE]
+> Nếu tổ chức của bạn chặn custom app, cần nhờ Teams Admin bật tính năng **"Allow uploading custom apps"** trong Teams Admin Center.
+
+---
+
+## Bước 6: Viết code xử lý Bot (Node.js)
+
+### 6.1. Tóm tắt Bot hoạt động thế nào
+
+```text
+Teams gửi tin nhắn → Microsoft Cloud → POST tới Bot server của bạn
+                                          → Bot xử lý lệnh
+                                          → Gọi Deploy API trên Rocky 9
+                                          → Trả kết quả về Teams
+```
+
+Bot server có thể chạy ở:
+- **Cùng server Rocky 9** (đơn giản nhất)
+- **Một VPS/cloud riêng** (Azure App Service, AWS, DigitalOcean...)
+- **Azure App Service Free Tier** (miễn phí cho bot nhỏ)
+
+### 6.2. Khởi tạo project Bot
+
+```bash
+# Tạo thư mục project (trên server hoặc máy dev)
+mkdir -p /opt/teams-bot
+cd /opt/teams-bot
+
+# Khởi tạo
+npm init -y
+
+# Cài các package cần thiết
+npm install botbuilder botframework-connector dotenv node-fetch@2
+```
+
+### 6.3. Tạo file `.env` cho Bot
+
+```bash
+cat > /opt/teams-bot/.env << 'EOF'
+# Azure Bot credentials (lấy từ Bước 5.2)
+MICROSOFT_APP_ID=xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx
+MICROSOFT_APP_PASSWORD=chuoi-secret-tu-azure
+
+# URL Deploy API trên server Rocky 9 (lấy từ Bước 4)
+DEPLOY_API_URL=https://deploy.your-domain.com/deploy
+DEPLOY_SECRET=doi-thanh-chuoi-bi-mat-cua-ban
+
+# Danh sách email được phép deploy (cách nhau bằng dấu phẩy)
+WHITELIST_USERS=admin@example.com,devops@example.com,techlead@example.com
+
+# Port cho Bot server
+PORT=3978
+EOF
+```
+
+### 6.4. Tạo file `index.js` — Code xử lý chính của Bot
+
+```bash
+cat > /opt/teams-bot/index.js << 'ENDOFFILE'
+require("dotenv").config();
+const { BotFrameworkAdapter, TurnContext } = require("botbuilder");
+const http = require("http");
+const fetch = require("node-fetch");
+
+// ===================== CẤU HÌNH =====================
+
+const adapter = new BotFrameworkAdapter({
+  appId: process.env.MICROSOFT_APP_ID,
+  appPassword: process.env.MICROSOFT_APP_PASSWORD,
+});
+
+const DEPLOY_API_URL = process.env.DEPLOY_API_URL;
+const DEPLOY_SECRET = process.env.DEPLOY_SECRET;
+const WHITELIST = (process.env.WHITELIST_USERS || "")
+  .split(",")
+  .map((e) => e.trim().toLowerCase())
+  .filter(Boolean);
+const PORT = Number(process.env.PORT || 3978);
+
+// Lưu các lệnh deploy đang chờ (key = conversationId)
+const pendingDeploys = new Map();
+
+// ===================== XỬ LÝ TIN NHẮN =====================
+
+adapter.onTurnError = async (context, error) => {
+  console.error("[Bot Error]", error);
+  await context.sendActivity("Đã xảy ra lỗi nội bộ. Vui lòng thử lại sau.");
+};
+
+async function handleMessage(context) {
+  // 1. Lấy nội dung tin nhắn (bỏ phần @mention)
+  const rawText = TurnContext.removeRecipientMention(context.activity) || "";
+  const text = rawText.trim().toLowerCase();
+  const userEmail = (
+    context.activity.from.aadObjectId
+      ? context.activity.from.userPrincipalName || context.activity.from.name
+      : context.activity.from.name || "unknown"
+  ).toLowerCase();
+  const conversationId = context.activity.conversation.id;
+
+  console.log(`[${new Date().toISOString()}] Nhận lệnh: "${text}" từ: ${userEmail}`);
+
+  // 2. Parse lệnh
+  if (text === "cancel") {
+    return handleCancel(context, conversationId, userEmail);
+  }
+
+  if (text === "status") {
+    return handleStatus(context, conversationId);
+  }
+
+  const deployMatch = text.match(/^deploy\s+(api|website|all)$/);
+  if (!deployMatch) {
+    return context.sendActivity(
+      "❓ **Lệnh không hợp lệ.**\n\n" +
+      "Các lệnh được hỗ trợ:\n" +
+      "- `deploy api` — Triển khai dịch vụ API\n" +
+      "- `deploy website` — Triển khai dịch vụ Website\n" +
+      "- `deploy all` — Triển khai toàn bộ\n" +
+      "- `status` — Kiểm tra trạng thái\n" +
+      "- `cancel` — Hủy lệnh deploy đang chờ"
+    );
+  }
+
+  const target = deployMatch[1];
+
+  // 3. Kiểm tra quyền
+  if (!WHITELIST.includes(userEmail)) {
+    return context.sendActivity(
+      `🚫 **Từ chối truy cập.**\n\nTài khoản \`${userEmail}\` không có quyền thực hiện deploy.`
+    );
+  }
+
+  // 4. Kiểm tra đã có lệnh đang chờ chưa
+  if (pendingDeploys.has(conversationId)) {
+    return context.sendActivity(
+      "⏳ Đã có một lệnh deploy đang trong thời gian chờ. " +
+      "Gõ `cancel` để hủy lệnh cũ trước khi tạo lệnh mới."
+    );
+  }
+
+  // 5. Thông báo và bắt đầu đếm ngược 2 phút
+  await context.sendActivity(
+    `⏱️ **Lệnh \`deploy ${target}\` sẽ tự động bắt đầu sau 2 phút.**\n\n` +
+    `- Người yêu cầu: \`${userEmail}\`\n` +
+    `- Gõ \`@DeployBot cancel\` để hủy nếu cần.\n\n` +
+    `⚠️ *Vui lòng tạm dừng thao tác trên production trong thời gian này.*`
+  );
+
+  // 6. Đặt timer 120 giây
+  const timer = setTimeout(async () => {
+    pendingDeploys.delete(conversationId);
+
+    // Gọi Deploy API
+    try {
+      await context.sendActivity(`🚀 Hết thời gian chờ. Đang tiến hành deploy **${target}**...`);
+
+      const response = await fetch(DEPLOY_API_URL, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${DEPLOY_SECRET}`,
+          "Content-Type": "application/json",
+        },
+        body: JSON.stringify({
+          target: target,
+          requested_by: userEmail,
+          source: "microsoft-teams",
+        }),
+      });
+
+      const result = await response.json();
+
+      if (result.ok) {
+        await context.sendActivity(
+          `✅ **Deploy thành công!**\n\n` +
+          `- Dịch vụ: \`${result.target}\`\n` +
+          `- Commit: \`${result.commit || "N/A"}\`\n` +
+          `- Thời gian: ${result.duration_seconds}s\n` +
+          `- Người yêu cầu: \`${userEmail}\``
+        );
+      } else {
+        await context.sendActivity(
+          `❌ **Deploy thất bại!**\n\n` +
+          `- Dịch vụ: \`${target}\`\n` +
+          `- Lý do: ${result.message}\n` +
+          `- Người yêu cầu: \`${userEmail}\`\n\n` +
+          `Vui lòng kiểm tra log trên server.`
+        );
+      }
+    } catch (err) {
+      console.error("[Deploy Error]", err);
+      await context.sendActivity(
+        `❌ **Không thể kết nối tới Deploy API.**\n\n` +
+        `Lỗi: ${err.message}\n\n` +
+        `Vui lòng kiểm tra server Rocky 9 có đang chạy không.`
+      );
+    }
+  }, 120_000); // 120 giây = 2 phút
+
+  pendingDeploys.set(conversationId, { timer, target, userEmail });
+}
+
+// ===================== XỬ LÝ CANCEL =====================
+
+async function handleCancel(context, conversationId, userEmail) {
+  const pending = pendingDeploys.get(conversationId);
+
+  if (!pending) {
+    return context.sendActivity("ℹ️ Hiện không có lệnh deploy nào đang chờ để hủy.");
+  }
+
+  // Kiểm tra quyền cancel
+  if (!WHITELIST.includes(userEmail)) {
+    return context.sendActivity("🚫 Bạn không có quyền hủy lệnh deploy.");
+  }
+
+  clearTimeout(pending.timer);
+  pendingDeploys.delete(conversationId);
+
+  await context.sendActivity(
+    `🛑 **Lệnh deploy đã được HỦY.**\n\n` +
+    `- Lệnh bị hủy: \`deploy ${pending.target}\`\n` +
+    `- Người hủy: \`${userEmail}\``
+  );
+}
+
+// ===================== XỬ LÝ STATUS =====================
+
+async function handleStatus(context, conversationId) {
+  const pending = pendingDeploys.get(conversationId);
+
+  if (pending) {
+    return context.sendActivity(
+      `⏳ **Đang có lệnh deploy chờ xử lý:**\n\n` +
+      `- Dịch vụ: \`deploy ${pending.target}\`\n` +
+      `- Người yêu cầu: \`${pending.userEmail}\`\n` +
+      `- Gõ \`cancel\` để hủy.`
+    );
+  }
+
+  return context.sendActivity("✅ Không có lệnh deploy nào đang chờ xử lý.");
+}
+
+// ===================== HTTP SERVER =====================
+
+const server = http.createServer(async (req, res) => {
+  if (req.method === "POST" && req.url === "/api/messages") {
+    let body = "";
+    req.on("data", (chunk) => { body += chunk; });
+    req.on("end", async () => {
+      try {
+        const activity = JSON.parse(body);
+        const authHeader = req.headers.authorization || "";
+
+        await adapter.processActivity(
+          { ...req, body: activity, headers: { ...req.headers, authorization: authHeader } },
+          res,
+          async (context) => {
+            if (context.activity.type === "message") {
+              await handleMessage(context);
+            }
+          }
+        );
+      } catch (err) {
+        console.error("[Server Error]", err);
+        res.writeHead(500);
+        res.end("Internal Server Error");
+      }
+    });
+  } else if (req.method === "GET" && req.url === "/health") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ok: true, message: "Bot is running" }));
+  } else {
+    res.writeHead(404);
+    res.end("Not found");
+  }
+});
+
+server.listen(PORT, () => {
+  console.log(`Teams Bot Server đang chạy tại port ${PORT}`);
+  console.log(`Messaging endpoint: http://localhost:${PORT}/api/messages`);
+  console.log(`Whitelist: ${WHITELIST.join(", ")}`);
+});
+ENDOFFILE
+```
+
+> [!NOTE]
+> **Giải thích code trên hoạt động thế nào:**
+> 1. Teams gửi POST request tới `/api/messages` mỗi khi có người gõ tin nhắn mention bot
+> 2. Bot đọc tin nhắn, bỏ phần `@DeployBot`, lấy phần lệnh (ví dụ `deploy all`)
+> 3. Kiểm tra email người gửi có trong whitelist không
+> 4. Nếu OK → Gửi thông báo "chờ 2 phút" → Đặt setTimeout 120 giây
+> 5. Trong 2 phút đó, nếu ai gõ `cancel` → Hủy timer
+> 6. Hết 2 phút không bị cancel → Gọi HTTP POST tới Deploy API trên Rocky 9
+> 7. Nhận kết quả → Gửi tin nhắn kết quả về channel
+
+### 6.5. Cài Bot chạy nền bằng systemd
+
+```bash
+sudo cat > /etc/systemd/system/teams-bot.service << 'EOF'
+[Unit]
+Description=Microsoft Teams Deploy Bot
+After=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/teams-bot
+EnvironmentFile=/opt/teams-bot/.env
+ExecStart=/usr/bin/node /opt/teams-bot/index.js
+Restart=always
+RestartSec=5
+User=deploy
+Group=deploy
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable teams-bot
+sudo systemctl start teams-bot
+
+# Kiểm tra
+sudo systemctl status teams-bot
+```
+
+---
+
+# PHẦN 4: KIỂM TRA VÀ XỬ LÝ SỰ CỐ
+
+---
+
+## Bước 7: Kiểm tra toàn bộ hệ thống
+
+### 7.1. Checklist kiểm tra từng phần
+
+Kiểm tra theo thứ tự từ dưới lên (từ server đến Teams):
+
+```text
+Thứ tự test:
+  ① Shell script → ② Deploy API → ③ Bot server → ④ Teams chat
+```
+
+| # | Kiểm tra | Lệnh/Thao tác | Kết quả đúng |
+|---|----------|----------------|---------------|
+| 1 | Docker chạy được | `sudo -u deploy docker ps` | Không lỗi permission |
+| 2 | Git pull được | `sudo -u deploy bash -c "cd /opt/apps/my-app && git fetch origin"` | Kéo code không lỗi |
+| 3 | Script deploy | `sudo -u deploy /opt/deploy/deploy.sh all` | In ra "DEPLOY HOÀN TẤT" |
+| 4 | Deploy API sống | `curl http://localhost:9000/health` | `{"ok":true}` |
+| 5 | Deploy API nhận lệnh | `curl -X POST localhost:9000/deploy -H "Authorization: Bearer <token>" -H "Content-Type: application/json" -d '{"target":"all"}'` | `{"ok":true,"commit":"..."}` |
+| 6 | Bot server sống | `curl http://localhost:3978/health` | `{"ok":true}` |
+| 7 | Bot nhận tin nhắn | Gõ `@DeployBot deploy all` trên Teams | Bot trả lời "sẽ bắt đầu sau 2 phút" |
+| 8 | Cancel hoạt động | Gõ `@DeployBot cancel` trong 2 phút | Bot trả lời "đã được HỦY" |
+
+### 7.2. Xử lý lỗi thường gặp
+
+| Hiện tượng | Nguyên nhân | Cách sửa |
+|-----------|-------------|---------|
+| Bot không phản hồi trên Teams | Messaging Endpoint sai hoặc Bot server chưa chạy | Kiểm tra URL ở Azure Bot → Configuration, đảm bảo HTTPS và server đang listen |
+| `401 Unauthorized` khi gọi Deploy API | Sai DEPLOY_SECRET | So khớp giá trị trong `.env` của Deploy API và `.env` của Bot |
+| `Permission denied` khi chạy docker | User deploy chưa trong group docker | `sudo usermod -aG docker deploy` rồi logout/login lại |
+| `git: Permission denied (publickey)` | SSH deploy key chưa đúng | Kiểm tra `~deploy/.ssh/config` và key đã add trên GitHub/GitLab |
+| Bot báo "Lệnh không hợp lệ" | Cú pháp sai hoặc Bot nhận thêm ký tự từ Teams | Kiểm tra hàm `removeRecipientMention` có loại bỏ hết tag HTML không |
+| Deploy API trả về 409 | Có phiên deploy khác đang chạy | Kiểm tra file `/tmp/my-app-deploy.lock` có tồn tại không, xóa nếu bị treo |
+
+---
+
+# PHẦN 5: BẢO MẬT, LOGGING VÀ VẬN HÀNH
+
+---
+
+## 8. Các quy tắc bảo mật bắt buộc
+
+Để bảo vệ máy chủ Rocky 9 khỏi các nguy cơ tấn công mạng, bắt buộc phải triển khai đầy đủ các lớp bảo mật sau:
+
+1. **Kiểm soát chặt chẽ phía Bot**:
+   * Tuyệt đối không cho phép Bot nhận và truyền lệnh tùy biến dạng văn bản tự do (ví dụ không cho gõ tham số tùy ý).
+   * Chỉ cho người dùng trong danh sách Whitelist cứng (Email chính xác hoặc ID người dùng Teams đã được xác thực) kích hoạt lệnh.
+2. **Bảo vệ Endpoint Deploy API**:
+   * Token xác thực Bearer token phải đủ dài, phức tạp và được lưu trữ an toàn trong biến môi trường (.env), tuyệt đối không đẩy lên Git (sử dụng `.gitignore`).
+   * Sử dụng HTTPS (Cấu hình Reverse Proxy qua Nginx có cài đặt SSL/TLS từ Let's Encrypt) để mã hóa toàn bộ dữ liệu truyền đi.
+   * Cấu hình tường lửa (FirewallD hoặc IP Tables) chỉ cho phép địa chỉ IP của Bot (hoặc dải IP dịch vụ Teams Cloud nếu triển khai trực tiếp) truy cập vào cổng API (9000).
+3. **Phân quyền tối thiểu (Principle of Least Privilege)**:
+   * Chạy Deploy API và Deploy Script dưới user hệ thống không có quyền root (`deploy`).
+   * User `deploy` được cấp quyền tương tác với Docker qua lệnh `sudo usermod -aG docker deploy`.
+   * Hạn chế tuyệt đối việc sử dụng cấu hình Sudo không mật khẩu trên diện rộng (`deploy ALL=(ALL) NOPASSWD: ALL`). Nếu cần chạy các dịch vụ hệ thống đặc thù, chỉ cấp quyền cho chính xác câu lệnh đó:
+     ```text
+     deploy ALL=(root) NOPASSWD: /usr/bin/systemctl restart nginx
+     ```
+4. **Git Deploy Key**:
+   * Mã nguồn trên server nên được pull bằng cơ chế SSH Deploy Key được cấu hình riêng trên GitHub/GitLab với quyền hạn **Read-Only** (chỉ đọc), ngăn chặn nguy cơ hacker chiếm quyền ghi ngược lại kho lưu trữ mã nguồn chính.
+
+---
+
+## 9. Nhật ký hoạt động và Audit
+
+Mỗi phiên deploy cần được ghi lại thông tin nhật ký nhằm phục vụ việc kiểm toán, điều tra sự cố sau này.
+
+* **Thông tin lưu trữ bắt buộc**:
+  * Thời điểm yêu cầu deploy.
+  * Địa chỉ email người thực hiện trên Teams.
+  * Dịch vụ đích triển khai (`api`, `website`, `all`).
+  * Mã SHA commit trước khi chạy và mã SHA commit mới nhất sau khi hoàn tất.
+  * Kết quả triển khai (Thành công/Thất bại/Mã lỗi).
+  * Tổng thời gian thực thi (giây).
+  * Đường dẫn lưu trữ chi tiết tệp log của phiên đó.
+
+* **Định dạng file log chi tiết**: `/var/log/my-app/deploy-YYYYMMDD-HHMMSS.log` chứa toàn bộ tiến trình pull code và build docker của phiên chạy đó để DevOps tiện truy vết khi xảy ra lỗi.
+
+---
+
+## 10. Gợi ý cơ chế Rollback (Quay lui phiên bản)
+
+Khi phiên bản mới deploy lên gặp lỗi nghiêm trọng, hệ thống cần hỗ trợ tính năng quay lui nhanh về phiên bản hoạt động ổn định gần nhất.
+
+### 10.1. Cơ chế lưu trữ phiên bản cũ trong Script
+Trước khi thực hiện lệnh `git reset --hard` để kéo code mới, script sẽ ghi lại mã commit hiện tại:
+```bash
+PREVIOUS_COMMIT="$(git rev-parse --short HEAD)"
+echo "Phiên bản cũ để dự phòng rollback: $PREVIOUS_COMMIT"
+```
+
+### 10.2. Lệnh Rollback từ Teams
+Có thể mở rộng thêm một câu lệnh dành riêng cho Quản trị viên cao cấp (Lead DevOps/Tech Lead) gõ trên Teams:
+```text
+@DeployBot rollback
+```
+* **Quy trình hoạt động:** Bot gọi tới endpoint `/rollback` của Deploy API. Script thực hiện di chuyển con trỏ Git về commit cũ trước đó và khởi động lại Docker Container:
+```bash
+cd /opt/apps/my-app
+git reset --hard "$PREVIOUS_COMMIT"
+docker compose build
+docker compose up -d
+```
+
+---
+
+## 11. Các pha triển khai đề xuất để giảm thiểu rủi ro
+
+Để quá trình xây dựng hệ thống diễn ra an toàn và không gây gián đoạn hệ thống hiện tại, khuyến nghị chia tiến trình ra làm 3 pha chính:
+
+* **Pha 1: Triển khai Script thủ công & Báo cáo một chiều (Webhook)**:
+  * Tạo kịch bản bash shell `/opt/deploy/deploy.sh` và chạy thử bằng tay trên server Rocky 9 để kiểm tra tính ổn định của docker compose, git keys.
+  * Tích hợp Webhook đơn giản để khi script chạy xong bằng tay, nó sẽ tự động bắn một HTTP POST thông báo kết quả lên nhóm chat Teams.
+* **Pha 2: Cài đặt và Bảo mật hóa Deploy API**:
+  * Lập trình và cài đặt ứng dụng Node.js nhận lệnh trên server.
+  * Kiểm tra bảo mật và hiệu năng của API bằng công cụ dòng lệnh `curl` từ bên ngoài (mô phỏng cuộc gọi từ Teams Bot), đảm bảo cơ chế xác thực Bearer token, phân quyền thư mục log và cơ chế Locking hoạt động chính xác.
+* **Pha 3: Tích hợp đầy đủ Microsoft Teams Bot**:
+  * Đăng ký và lập trình Teams Bot.
+  * Tích hợp các nghiệp vụ kiểm tra Whitelist, bộ đếm thời gian hoãn 2 phút, và chức năng Cancel.
+  * Tiến hành chạy thử nghiệm toàn trình từ Teams đến máy chủ thực tế.
+
+---
+
+# PHẦN 6: SƠ ĐỒ FILE VÀ LỆNH QUẢN TRỊ NHANH
+
+---
+
+## 12. Sơ đồ tóm tắt toàn bộ file và đường dẫn
+
+```text
+Server Rocky 9
+├── /opt/deploy/
+│   └── deploy.sh                  ← Shell script deploy (Bước 3)
+│
+├── /opt/deploy-api/
+│   ├── .env                       ← Cấu hình Deploy API (Bước 4.2)
+│   ├── server.js                  ← Code Deploy API (Bước 4.3)
+│   ├── package.json
+│   └── node_modules/
+│
+├── /opt/teams-bot/
+│   ├── .env                       ← Cấu hình Bot (Bước 6.3)
+│   ├── index.js                   ← Code Bot (Bước 6.4)
+│   ├── package.json
+│   └── node_modules/
+│
+├── /opt/apps/my-app/
+│   ├── docker-compose.yml         ← File Docker Compose của ứng dụng
+│   ├── src/                       ← Mã nguồn ứng dụng
+│   └── ...
+│
+├── /var/log/my-app/
+│   └── deploy-YYYYMMDD-HHMMSS.log ← Log mỗi lần deploy
+│
+├── /etc/systemd/system/
+│   ├── deploy-api.service         ← Systemd service cho Deploy API
+│   └── teams-bot.service          ← Systemd service cho Bot
+│
+└── /tmp/
+    └── my-app-deploy.lock         ← Lock file chống deploy đè
+
+Azure Portal
+├── Azure Bot Resource             ← Đăng ký bot (Bước 5.1)
+├── Microsoft App ID               ← Dùng trong .env Bot
+└── Client Secret                  ← Dùng trong .env Bot
+
+Microsoft Teams
+└── Custom App (DeployBot.zip)     ← Cài vào Team/Channel (Bước 5.6)
+    ├── manifest.json
+    ├── color.png (192x192)
+    └── outline.png (32x32)
+```
+
+---
+
+## 13. Tham khảo nhanh các lệnh quản trị
+
+```bash
+# ===== Xem log Deploy API =====
+sudo journalctl -u deploy-api -f          # Log realtime
+sudo journalctl -u deploy-api --since today  # Log hôm nay
+
+# ===== Xem log Teams Bot =====
+sudo journalctl -u teams-bot -f
+
+# ===== Xem log deploy gần nhất =====
+ls -lt /var/log/my-app/ | head -5         # Liệt kê 5 file log gần nhất
+cat /var/log/my-app/deploy-*.log | tail -50  # Xem 50 dòng cuối log gần nhất
+
+# ===== Khởi động lại service =====
+sudo systemctl restart deploy-api
+sudo systemctl restart teams-bot
+
+# ===== Kiểm tra trạng thái =====
+sudo systemctl status deploy-api
+sudo systemctl status teams-bot
+
+# ===== Xóa lock file bị treo (dùng khi deploy bị kẹt) =====
+rm -f /tmp/my-app-deploy.lock
+
+# ===== Deploy thủ công (không qua Bot) =====
+sudo -u deploy /opt/deploy/deploy.sh all
+sudo -u deploy /opt/deploy/deploy.sh api
+sudo -u deploy /opt/deploy/deploy.sh website
+
+# ===== Test Deploy API bằng curl =====
+curl -X POST https://deploy.your-domain.com/deploy \
+  -H "Authorization: Bearer TOKEN_CUA_BAN" \
+  -H "Content-Type: application/json" \
+  -d '{"target":"all","requested_by":"admin@example.com"}'
+```
