@@ -1,0 +1,6 @@
+cat /etc/os-release
+hostnamectl
+systemctl list-units --type=service --state=running
+ss -tulnp
+df -h
+free -h
