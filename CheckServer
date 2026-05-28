@@ -7,3 +7,6 @@ free -h
 
 sudo docker ps (Xem container đang chạy)
 ps -ef | grep camunda (check camunda)
+sudo vi /etc/nginx/conf.d/camunda.conf
+
+
