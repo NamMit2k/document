@@ -4,3 +4,6 @@ systemctl list-units --type=service --state=running
 ss -tulnp
 df -h
 free -h
+
+sudo docker ps (Xem container đang chạy)
+ps -ef | grep camunda (check camunda)
