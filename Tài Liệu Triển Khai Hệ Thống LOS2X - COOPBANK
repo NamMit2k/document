@@ -1,0 +1,529 @@
+Tài Liệu Triển Khai Hệ Thống LOS2X
+Phiên bản: 4.0
+Cập nhật: 29/05/2026
+Kiến trúc: Docker Compose + Nginx Reverse Proxy (máy chủ riêng)
+
+Mục Lục
+PHẦN A — APPLICATION SERVER (Docker)
+A1. Chuẩn bị Server
+A2. Clone Mã Nguồn
+A3. Cấu hình Docker
+A4. Build & Khởi chạy
+A5. Kiểm tra sau khi chạy
+A6. Quản lý Log
+PHẦN B — NGINX REVERSE PROXY (Máy chủ riêng)
+B1. Tạo chứng chỉ SSL
+B2. Cấu hình Nginx
+B3. Áp dụng cấu hình
+PHẦN C — VẬN HÀNH & XỬ LÝ SỰ CỐ
+C1. Cập nhật code mới
+C2. Lệnh Docker hữu ích
+C3. Xử lý lỗi thường gặp
+PHẦN A — APPLICATION SERVER (Docker)
+IMPORTANT
+
+Phần này thực hiện trên máy chủ cài Docker (ví dụ: 172.20.1.96). Hệ điều hành: Rocky Linux 9 / RHEL 9 / CentOS 9
+
+A1. Chuẩn bị Server
+A1.1. Kiểm tra dung lượng ổ đĩa
+bash
+
+df -h
+lsblk
+WARNING
+
+Ổ gốc / phải có tối thiểu 20GB trống để Docker hoạt động ổn định. Nếu ổ đầy 100%, xem mục 
+C3.6 - Xử lý ổ đĩa đầy
+.
+
+A1.2. Cài đặt các gói cần thiết
+bash
+
+# Cài Git
+sudo dnf install -y git
+# Khởi động Docker (giả sử Docker đã được cài sẵn)
+sudo systemctl start docker
+sudo systemctl enable docker
+# Thêm user hiện tại vào nhóm Docker (thoát SSH và vào lại để có hiệu lực)
+sudo usermod -aG docker $(whoami)
+A1.3. Mở Firewall
+bash
+
+# Mở cổng cho Website (8086) và API (8085)
+sudo firewall-cmd --permanent --add-port=8085/tcp
+sudo firewall-cmd --permanent --add-port=8086/tcp
+sudo firewall-cmd --reload
+# Kiểm tra lại
+sudo firewall-cmd --list-ports
+A2. Clone Mã Nguồn
+A2.1. Tạo thư mục và clone
+bash
+
+# Tạo thư mục chứa code tại /opt (cần quyền sudo)
+sudo mkdir -p /opt/coopbank
+sudo chown -R $(whoami):$(whoami) /opt/coopbank
+# Clone source code (thay <YOUR_PAT> bằng Azure DevOps PAT thực tế)
+# Format: https://pat:<YOUR_PAT>@dev.azure.com/...
+git clone https://pat:<YOUR_PAT>@dev.azure.com/istscompany/LOS%20Application%202x/_git/LOS2X /opt/coopbank
+# Chuyển sang branch cần deploy
+cd /opt/coopbank
+git checkout testing
+NOTE
+
+Về PAT (Personal Access Token):
+
+PAT chỉ là 1 chuỗi token duy nhất.
+Trong URL, chữ pat trước dấu : là username giả (Azure DevOps bỏ qua), PAT thật nằm sau dấu :.
+Nếu PAT chứa ký tự đặc biệt (/, +, =), hãy dùng cách thủ công: clone bình thường, khi hỏi password thì paste PAT vào.
+A2.2. Kiểm tra clone thành công
+bash
+
+git log -1 --oneline
+# Kết quả mong đợi: hiển thị commit hash và branch name
+A3. Cấu hình Docker
+A3.1. Tạo thư mục deploy
+bash
+
+cd /opt/coopbank
+mkdir -p deploy
+cd deploy
+A3.2. Tạo file .env
+bash
+
+vi .env
+Nội dung:
+
+ini
+
+AZDO_PAT=<paste_PAT_thực_tế_vào_đây>
+FEED_URL=https://pkgs.dev.azure.com/istscompany/_packaging/ISTSNuget/nuget/v3/index.json
+ASPNETCORE_ENVIRONMENT=Docker_Main
+Phân quyền bảo mật:
+
+bash
+
+chmod 600 .env
+A3.3. Tạo file docker-compose.yml
+IMPORTANT
+
+NGUYÊN TẮC VÀNG: Vì dùng chung source code cho nhiều dự án, TUYỆT ĐỐI KHÔNG sửa file appsettings.json. Mọi cấu hình riêng của từng dự án phải được ghi đè bằng biến môi trường (environment) trong file docker-compose.yml.
+
+Quy tắc chuyển đổi: Đổi dấu : trong JSON thành __ (hai dấu gạch dưới). Ví dụ: ConnectionStrings:DefaultConnection → ConnectionStrings__DefaultConnection
+
+bash
+
+vi docker-compose.yml
+Nội dung mẫu cho dự án CoopBank:
+
+yaml
+
+services:
+  coopbank-website:
+    build:
+      context: ../
+      dockerfile: ISTS.Website/Dockerfile
+      secrets:
+        - azdo_pat
+      args:
+        FEED_URL: ${FEED_URL}
+    image: coopbank/coopbank-website:latest
+    container_name: coopbank-website
+    restart: unless-stopped
+    ports:
+      - "8086:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=${ASPNETCORE_ENVIRONMENT:-Docker_Main}
+      - TZ=Asia/Ho_Chi_Minh
+      # Website gọi API qua mạng nội bộ Docker (nhanh, không qua Nginx)
+      - AppSettings__APIUrl=http://coopbank-api:8080/
+    volumes:
+      - website-logs:/app/Logs
+    networks:
+      - coopbank-network
+  coopbank-api:
+    build:
+      context: ../
+      dockerfile: ISTS.Inbound.MyBank/Dockerfile
+      secrets:
+        - azdo_pat
+      args:
+        FEED_URL: ${FEED_URL}
+    image: coopbank/coopbank-api:latest
+    container_name: coopbank-api
+    restart: unless-stopped
+    ports:
+      - "8085:8080"
+    environment:
+      - ASPNETCORE_ENVIRONMENT=${ASPNETCORE_ENVIRONMENT:-Docker_Main}
+      - TZ=Asia/Ho_Chi_Minh
+      # ===== GHI ĐÈ CẤU HÌNH RIÊNG CHO DỰ ÁN =====
+      # Database Oracle
+      - ConnectionStrings__DefaultConnection=User Id=LOS_DEV;Password=admin123;Data Source=172.20.1.68:1521/los2x;Max Pool Size=5000;Connection Timeout=180; Decr Pool Size=5;
+      - ConnectionStrings__ElmahConnection=User Id=LOS_DEV;Password=admin123;Data Source=172.20.1.68:1521/los2x;Max Pool Size=5000;Connection Timeout=180; Decr Pool Size=5;
+      # URL công khai của API (dùng cho callback, generate link)
+      - AppSettings__APIUrl=https://cb-los-testing.ists.corp:444/
+      # URL công khai của Website (dùng cho redirect)
+      - AppSettings__ApplicationUrl=https://cb-los-testing.ists.corp/
+      # Camunda BPM
+      - BpmSettings__EndPoint=http://172.20.1.70:8080/
+      - BpmSettings__TenantId=CoopBank-LOS
+      # Log level (Debug để ghi đầy đủ, Information cho production)
+      - Serilog__MinimumLevel=Debug
+    volumes:
+      - api-logs:/app/Logs
+    networks:
+      - coopbank-network
+secrets:
+  azdo_pat:
+    environment: AZDO_PAT
+volumes:
+  website-logs:
+  api-logs:
+networks:
+  coopbank-network:
+    driver: bridge
+A3.4. Bảng tham chiếu biến môi trường
+Dưới đây là danh sách đầy đủ các biến môi trường có thể ghi đè, tương ứng với cấu hình trong appsettings.json:
+
+Tham số gốc (appsettings.json)	Biến môi trường (docker-compose)	Ví dụ giá trị
+ConnectionStrings:DefaultConnection	ConnectionStrings__DefaultConnection	User Id=...;Data Source=IP:1521/DB;...
+ConnectionStrings:ElmahConnection	ConnectionStrings__ElmahConnection	(giống DefaultConnection)
+AppSettings:APIUrl	AppSettings__APIUrl	https://cb-los-testing.ists.corp:444/
+AppSettings:ApplicationUrl	AppSettings__ApplicationUrl	https://cb-los-testing.ists.corp/
+BpmSettings:EndPoint	BpmSettings__EndPoint	http://172.20.1.70:8080/
+BpmSettings:TenantId	BpmSettings__TenantId	CoopBank-LOS
+AuthenticationSettings:LDAPHost	AuthenticationSettings__LDAPHost	ldap.company.com
+AuthenticationSettings:LDAPPort	AuthenticationSettings__LDAPPort	389
+Serilog:MinimumLevel	Serilog__MinimumLevel	Debug / Information / Warning
+Customization:EndPoint	Customization__EndPoint	http://service-url/
+TIP
+
+Ưu điểm của cách dùng biến môi trường:
+
+Không conflict Git — File appsettings.json giữ nguyên, git pull thoải mái.
+Không cần build lại — Chỉ cần docker compose up -d là nhận cấu hình mới trong 1 giây.
+Linh hoạt — Mỗi dự án/server có file docker-compose.yml riêng, cùng chung source code.
+A4. Build & Khởi chạy
+bash
+
+cd /opt/coopbank/deploy
+# Bật BuildKit để tăng tốc build
+export DOCKER_BUILDKIT=1
+# Build image (lần đầu mất 3-5 phút)
+sudo docker compose build
+# Khởi chạy (chạy ngầm)
+sudo docker compose up -d
+A5. Kiểm tra sau khi chạy
+A5.1. Kiểm tra container đang chạy
+bash
+
+sudo docker compose ps
+Kết quả mong đợi: 2 container có trạng thái Up:
+
+
+NAME               STATUS        PORTS
+coopbank-website   Up            0.0.0.0:8086->8080/tcp
+coopbank-api       Up            0.0.0.0:8085->8080/tcp
+A5.2. Test kết nối HTTP
+bash
+
+# Test Website
+curl -I http://localhost:8086
+# Test API (Swagger)
+curl -I http://localhost:8085/swagger
+A5.3. Test kết nối Database từ bên trong container
+bash
+
+# Kiểm tra cổng Oracle 1521 có thông không
+sudo docker compose exec coopbank-api bash -c \
+  'timeout 3 bash -c "</dev/tcp/172.20.1.68/1521" && echo "✅ PORT 1521 MỞ" || echo "❌ PORT 1521 BỊ CHẶN"'
+A6. Quản lý Log
+A6.1. Kiến trúc Log
+
+┌─────────────────────────────────────────────────┐
+│  Container (coopbank-api)                       │
+│  Ứng dụng ghi log vào: /app/Logs               │
+│         ↓ (Docker Volume mount ra ngoài)        │
+├─────────────────────────────────────────────────┤
+│  Máy chủ Linux                                  │
+│  /var/lib/docker/volumes/deploy_api-logs/_data  │
+└─────────────────────────────────────────────────┘
+IMPORTANT
+
+Log BẮT BUỘC phải mount ra ngoài server (dùng Docker Named Volume).
+
+Khi container bị xóa/crash → file log vẫn còn nguyên trên ổ cứng.
+Không làm phình to dung lượng container.
+A6.2. Xem log Console (nhanh nhất)
+bash
+
+# Xem log API (realtime, nhấn Ctrl+C để thoát)
+sudo docker compose logs -f --tail=100 coopbank-api
+# Xem log Website
+sudo docker compose logs -f --tail=100 coopbank-website
+A6.3. Xem log file trên ổ cứng
+bash
+
+# Tìm đường dẫn vật lý
+sudo docker volume inspect deploy_api-logs | grep Mountpoint
+sudo docker volume inspect deploy_website-logs | grep Mountpoint
+# Vào thư mục log (cần quyền root)
+sudo su -
+cd /var/lib/docker/volumes/deploy_api-logs/_data
+ls -la
+less BPM-API-{Date}20260529.log    # Nhấn 'q' để thoát
+# QUAN TRỌNG: Thoát quyền root sau khi xem xong
+exit
+A6.4. Tìm lỗi trong log
+bash
+
+# Lọc các dòng chứa lỗi
+sudo grep -i "ERR\|Exception\|Oracle\|LDAP" \
+  /var/lib/docker/volumes/deploy_api-logs/_data/*.log | tail -n 20
+PHẦN B — NGINX REVERSE PROXY (Máy chủ riêng)
+IMPORTANT
+
+Phần này thực hiện trên máy chủ Nginx riêng biệt (ví dụ: 172.20.1.55). Máy chủ này đảm nhiệm việc xử lý SSL và chuyển tiếp request đến Application Server.
+
+Sơ đồ kiến trúc
+
+Người dùng (Trình duyệt)
+    │
+    │  HTTPS (port 443 / 444)
+    ▼
+┌──────────────────────────────┐
+│  MÁY CHỦ NGINX (172.20.1.55)│
+│  - Xử lý SSL Certificate    │
+│  - Reverse Proxy             │
+└──────────┬───────────────────┘
+           │  HTTP (port 8086 / 8085)
+           ▼
+┌──────────────────────────────┐
+│  MÁY CHỦ DOCKER (172.20.1.96)│
+│  - coopbank-website (:8086)  │
+│  - coopbank-api     (:8085)  │
+└──────────────────────────────┘
+B1. Tạo chứng chỉ SSL
+B1.1. Kiểm tra chứng chỉ có sẵn
+bash
+
+# Liệt kê tất cả chứng chỉ đang có trên máy Nginx
+sudo find /etc/nginx -name "*.crt"
+# Xem cấu trúc Subject của chứng chỉ cũ (để tạo mới cho khớp mẫu)
+sudo openssl x509 -in /etc/nginx/ssl/test.los.ists.corp.crt -text -noout | grep "Subject:"
+B1.2. Tạo chứng chỉ tự ký mới (Self-signed)
+bash
+
+# Tạo thư mục (nếu chưa có)
+sudo mkdir -p /etc/nginx/ssl
+# Tạo chứng chỉ (thay Subject cho khớp mẫu công ty)
+# Ví dụ mẫu đang dùng: C=VN, ST=HN, L=Hanoi, O=ISTSCORP
+sudo openssl req -x509 -nodes -days 3650 -newkey rsa:2048 \
+  -keyout /etc/nginx/ssl/cb-los-testing.ists.corp.key \
+  -out /etc/nginx/ssl/cb-los-testing.ists.corp.crt \
+  -subj "/C=VN/ST=HN/L=Hanoi/O=ISTSCORP/CN=cb-los-testing.ists.corp"
+NOTE
+
+Chứng chỉ tự ký chỉ dùng cho môi trường Test/UAT nội bộ. Trình duyệt sẽ hiện cảnh báo SSL → Nhấn Advanced → Proceed để truy cập.
+
+B2. Cấu hình Nginx
+B2.1. Tạo file cấu hình
+bash
+
+sudo vi /etc/nginx/conf.d/cb-los-testing.conf
+Nội dung:
+
+nginx
+
+# ═══════════════════════════════════════════════════
+# CẤU HÌNH NGINX CHO DỰ ÁN COOPBANK LOS TESTING
+# ═══════════════════════════════════════════════════
+# --- Upstream: Trỏ về máy chủ Docker ---
+upstream coopbank_website {
+    server 172.20.1.96:8086;
+}
+upstream coopbank_api {
+    server 172.20.1.96:8085;
+}
+# --- Tự động chuyển HTTP → HTTPS ---
+server {
+    listen 80;
+    server_name cb-los-testing.ists.corp;
+    return 301 https://$host$request_uri;
+}
+# --- WEBSITE (Cổng 443) ---
+server {
+    listen 443 ssl;
+    server_name cb-los-testing.ists.corp;
+    # Cho phép upload file tối đa 100MB
+    client_max_body_size 100m;
+    # Chứng chỉ SSL
+    ssl_certificate     /etc/nginx/ssl/cb-los-testing.ists.corp.crt;
+    ssl_certificate_key /etc/nginx/ssl/cb-los-testing.ists.corp.key;
+    # Header chuyển tiếp (BẮT BUỘC cho .NET Core)
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host  $http_host;
+    location / {
+        proxy_pass http://coopbank_website;
+        access_log /var/log/nginx/access_coopbank_website.log;
+    }
+}
+# --- API (Cổng 444) ---
+server {
+    listen 444 ssl;
+    server_name cb-los-testing.ists.corp;
+    # QUAN TRỌNG: Phải có dòng này để tránh lỗi 413 khi upload file qua API
+    client_max_body_size 100m;
+    # Chứng chỉ SSL (dùng chung với Website)
+    ssl_certificate     /etc/nginx/ssl/cb-los-testing.ists.corp.crt;
+    ssl_certificate_key /etc/nginx/ssl/cb-los-testing.ists.corp.key;
+    # Header chuyển tiếp
+    proxy_set_header Host              $host;
+    proxy_set_header X-Real-IP         $remote_addr;
+    proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host  $http_host;
+    location / {
+        proxy_pass http://coopbank_api;
+        access_log /var/log/nginx/access_coopbank_api.log;
+    }
+}
+WARNING
+
+Lưu ý quan trọng:
+
+client_max_body_size 100m; phải có ở CẢ 2 khối (Website VÀ API), nếu thiếu ở khối API sẽ bị lỗi 413 Request Entity Too Large khi upload file.
+Bộ 5 header proxy_set_header là BẮT BUỘC để .NET Core nhận biết request đến từ HTTPS (tránh lỗi redirect loop).
+B3. Áp dụng cấu hình
+bash
+
+# Kiểm tra cú pháp cấu hình
+sudo nginx -t
+# Nếu báo "syntax is ok" → Nạp lại cấu hình
+sudo nginx -s reload
+B3.1. Mở Firewall trên máy Nginx (nếu cần)
+bash
+
+sudo firewall-cmd --permanent --add-port=443/tcp
+sudo firewall-cmd --permanent --add-port=444/tcp
+sudo firewall-cmd --reload
+B3.2. Kiểm tra
+Mở trình duyệt:
+
+Website: https://cb-los-testing.ists.corp
+API Swagger: https://cb-los-testing.ists.corp:444/swagger
+PHẦN C — VẬN HÀNH & XỬ LÝ SỰ CỐ
+C1. Cập nhật code mới
+Khi team có code mới, chạy các lệnh sau trên máy chủ Docker:
+
+bash
+
+cd /opt/coopbank
+# 1. Kéo code mới về (không bao giờ conflict vì không sửa appsettings)
+git pull
+# 2. Build lại image với code mới
+cd deploy
+export DOCKER_BUILDKIT=1
+sudo docker compose build
+# 3. Khởi động lại
+sudo docker compose up -d
+TIP
+
+Nếu chỉ thay đổi biến môi trường trong docker-compose.yml (không đổi code), chỉ cần chạy sudo docker compose up -d mà KHÔNG cần build lại.
+
+C2. Lệnh Docker hữu ích
+Mục đích	Lệnh
+Xem trạng thái container	sudo docker compose ps
+Xem log realtime	sudo docker compose logs -f --tail=100 coopbank-api
+Khởi động lại 1 container	sudo docker compose restart coopbank-api
+Dừng toàn bộ	sudo docker compose down
+Dọn rác Docker (image/cache cũ)	sudo docker system prune -af
+Xem dung lượng Docker đang chiếm	sudo docker system df
+Vào bên trong container để debug	sudo docker compose exec coopbank-api bash
+Test cổng từ bên trong container	sudo docker compose exec coopbank-api bash -c 'timeout 3 bash -c "</dev/tcp/IP/PORT"'
+C3. Xử lý lỗi thường gặp
+C3.1. pull access denied for coopbank/coopbank-website
+Nguyên nhân: Docker không tìm thấy image trên máy → chạy đi tải trên Docker Hub → bị từ chối. Cách sửa: Đảm bảo file docker-compose.yml có khối build: với đúng đường dẫn Dockerfile, sau đó chạy sudo docker compose build trước khi up -d.
+
+C3.2. no configuration file provided: not found
+Nguyên nhân: Đang đứng sai thư mục khi chạy docker compose. Cách sửa: Phải cd /opt/coopbank/deploy trước khi chạy lệnh.
+
+C3.3. Permission denied khi clone/tạo thư mục
+Nguyên nhân: Thư mục /opt thuộc quyền root. Cách sửa:
+
+bash
+
+sudo mkdir -p /opt/coopbank
+sudo chown -R $(whoami):$(whoami) /opt/coopbank
+C3.4. Connection refused khi test cổng Database
+Nguyên nhân: Firewall máy chủ Database chặn cổng 1521, hoặc Oracle Listener chưa bật, hoặc sai IP. Cách kiểm tra:
+
+Kiểm tra đúng IP chưa.
+Sang máy chủ Database mở firewall: sudo firewall-cmd --permanent --add-port=1521/tcp && sudo firewall-cmd --reload
+Kiểm tra Oracle Listener: lsnrctl status
+C3.5. target is busy khi umount hoặc docker rm
+Nguyên nhân: Có tiến trình đang sử dụng ổ đĩa/container. Cách sửa:
+
+bash
+
+# Tìm và tắt tiến trình đang bám
+sudo fuser -ck /đường/dẫn/bị/busy
+# Ép gỡ (Lazy unmount)
+sudo umount -l /đường/dẫn
+# Hoặc ép xóa container
+sudo docker rm -f tên_container
+C3.6. Ổ đĩa đầy 100%
+Triệu chứng: df -h hiện Use% = 100% cho ổ /. Cách xử lý nhanh:
+
+bash
+
+# Dọn rác Docker (xóa image/container/cache cũ)
+sudo docker system prune -af --volumes
+Nếu cần thêm dung lượng vĩnh viễn (gộp ổ đĩa phụ vào ổ gốc):
+
+CAUTION
+
+Thao tác này sẽ XÓA SẠCH dữ liệu trên ổ đĩa phụ. BẮT BUỘC phải sửa file /etc/fstab TRƯỚC KHI reboot, nếu không server sẽ không khởi động được.
+
+bash
+
+# 1. Ngắt kết nối ổ đĩa phụ
+sudo fuser -ck /var/oracle
+sudo umount -l /var/oracle
+# 2. XÓA cấu hình boot cũ (QUAN TRỌNG NHẤT)
+sudo sed -i '/\/var\/oracle/d' /etc/fstab
+sudo rm -f /etc/systemd/system/var-oracle.mount
+sudo systemctl daemon-reload
+# 3. Reboot để giải phóng hoàn toàn
+sudo reboot
+# 4. Sau khi reboot, gộp ổ
+sudo wipefs -a /dev/sda1
+sudo pvcreate -ff -y /dev/sda1
+sudo vgextend rl /dev/sda1
+sudo lvextend -l +100%FREE /dev/mapper/rl-root
+sudo xfs_growfs /
+# 5. Kiểm tra
+df -h
+# Kết quả: ổ / sẽ tăng lên đáng kể
+C3.7. Log không hiện dòng [ERR]
+Nguyên nhân: Ứng dụng dùng Serilog, không phải Microsoft Logger mặc định. Biến Logging__LogLevel__Default bị Serilog bỏ qua. Cách sửa: Dùng biến môi trường đúng của Serilog trong docker-compose.yml:
+
+yaml
+
+- Serilog__MinimumLevel=Debug
+C3.8. Nginx báo lỗi cannot load certificate
+Nguyên nhân: File chứng chỉ SSL không tồn tại tại đường dẫn được khai báo. Cách sửa:
+
+Kiểm tra file có tồn tại: sudo find /etc/nginx -name "*.crt"
+Nếu chưa có, tạo mới bằng lệnh openssl ở mục 
+B1.2
+.
+C3.9. Server không boot được sau khi thao tác ổ đĩa
+Nguyên nhân: File /etc/fstab vẫn tham chiếu đến ổ đĩa đã bị xóa/gỡ → Linux rơi vào Emergency Mode. Cách sửa: Khi màn hình hiện Emergency Mode:
+
+Gõ mật khẩu root để vào shell.
+Chạy: vi /etc/fstab → Xóa dòng chứa ổ đĩa cũ (ví dụ /var/oracle).
+Chạy: reboot
