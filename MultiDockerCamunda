@@ -1,0 +1,895 @@
+# Camunda 7 Docker Active-Active + Nginx Load Balancer (2 Server riêng biệt)
+
+Tài liệu hướng dẫn chi tiết triển khai:
+
+- **Server A (Nginx LB):** Rocky Linux 9, chỉ chạy Nginx làm load balancer
+- **Server B (Camunda Docker):** Rocky Linux 9, chạy 2 container Camunda 7 Tomcat bằng Docker
+- **Server C (Oracle DB):** Đã có sẵn tại `192.168.1.127:1521/XEPDB1`
+
+```text
+Kiến trúc:
+
+Client → Server A (Nginx :7777, sticky session ip_hash)
+              ↓
+         Server B (Camunda1 :8081 / Camunda2 :8082) ← Docker
+              ↓
+         Server C (Oracle DB 192.168.1.127:1521/XEPDB1)
+```
+
+## Yêu cầu mạng giữa các server
+
+```text
+Client       → Server A : port 7777 (HTTP)
+Server A     → Server B : port 8081, 8082 (Nginx → Camunda)
+Server B     → Server C : port 1521 (Camunda → Oracle JDBC)
+```
+
+## Placeholder cần thay thế
+
+```text
+<IP_SERVER_A>  = IP của server Nginx (Server A)
+<IP_SERVER_B>  = IP của server Camunda Docker (Server B)
+```
+
+---
+
+# PHẦN I — SERVER B: Camunda Docker
+
+> ⚠️ Thực hiện toàn bộ phần này trên **Server B**.
+
+---
+
+## 1. Cài Docker CE trên Rocky Linux 9
+
+### 1.1 Cập nhật OS và gỡ package xung đột
+
+```bash
+sudo dnf update -y
+sudo dnf remove -y podman buildah docker docker-client docker-client-latest \
+  docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine
+```
+
+### 1.2 Thêm Docker repo
+
+```bash
+sudo dnf install -y dnf-utils
+sudo dnf config-manager --add-repo https://download.docker.com/linux/rhel/docker-ce.repo
+```
+
+### 1.3 Cài Docker Engine + Compose plugin
+
+```bash
+sudo dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+```
+
+### 1.4 Start và enable Docker
+
+```bash
+sudo systemctl enable --now docker
+docker --version
+docker compose version
+```
+
+### 1.5 Cho user hiện tại chạy Docker không cần sudo (tùy chọn)
+
+```bash
+sudo usermod -aG docker $(whoami)
+```
+
+Đăng xuất rồi đăng nhập lại để có hiệu lực.
+
+---
+
+## 2. Tạo thư mục project
+
+```bash
+sudo mkdir -p /opt/camunda-docker/{config,driver}
+cd /opt/camunda-docker
+```
+
+Cấu trúc thư mục sau khi hoàn tất:
+
+```text
+/opt/camunda-docker/
+├── Dockerfile                 ← Build custom image chứa Oracle driver
+├── docker-compose.yml         ← Khai báo 2 container Camunda
+├── config/
+│   └── server.xml             ← Cấu hình Tomcat + Oracle datasource
+└── driver/
+    └── ojdbc11.jar            ← Oracle JDBC driver
+```
+
+---
+
+## 3. Tải Oracle JDBC Driver
+
+**Cách 1: Nếu server có Internet**
+
+```bash
+cd /opt/camunda-docker/driver
+sudo wget -O ojdbc11.jar \
+  https://repo1.maven.org/maven2/com/oracle/database/jdbc/ojdbc11/23.5.0.24.07/ojdbc11-23.5.0.24.07.jar
+```
+
+**Cách 2: Nếu server offline**
+
+1. Tải file trên Windows: [ojdbc11-23.5.0.24.07.jar](https://repo1.maven.org/maven2/com/oracle/database/jdbc/ojdbc11/23.5.0.24.07/ojdbc11-23.5.0.24.07.jar)
+2. SFTP lên server vào `/tmp/ojdbc11.jar`
+3. Copy vào project:
+
+```bash
+sudo cp /tmp/ojdbc11.jar /opt/camunda-docker/driver/ojdbc11.jar
+```
+
+---
+
+## 4. Tạo file cấu hình `server.xml` cho Oracle
+
+```bash
+sudo vim /opt/camunda-docker/config/server.xml
+```
+
+Nội dung (đã thay datasource H2 mặc định bằng Oracle):
+
+```xml
+<?xml version="1.0" encoding="UTF-8"?>
+<Server port="8005" shutdown="SHUTDOWN">
+  <Listener className="org.apache.catalina.startup.VersionLoggerListener" />
+  <Listener className="org.apache.catalina.core.AprLifecycleListener" SSLEngine="on" />
+  <Listener className="org.apache.catalina.core.JreMemoryLeakPreventionListener" />
+  <Listener className="org.apache.catalina.mbeans.GlobalResourcesLifecycleListener" />
+  <Listener className="org.apache.catalina.core.ThreadLocalLeakPreventionListener" />
+
+  <!-- BẮT BUỘC: Khởi chạy Camunda BPM Platform Engine toàn cục -->
+  <Listener className="org.camunda.bpm.container.impl.tomcat.TomcatBpmPlatformBootstrap" />
+
+  <GlobalNamingResources>
+    <Resource name="UserDatabase" auth="Container"
+              type="org.apache.catalina.UserDatabase"
+              description="User database that can be updated and saved"
+              factory="org.apache.catalina.users.MemoryUserDatabaseFactory"
+              pathname="conf/tomcat-users.xml" />
+
+    <!-- Đăng ký JNDI ProcessEngine ở Global để tất cả ứng dụng (camunda-welcome, engine-rest, camunda-invoice) đều dùng được -->
+    <Resource name="jdbc/ProcessEngine"
+              auth="Container"
+              type="javax.sql.DataSource"
+              factory="org.apache.tomcat.jdbc.pool.DataSourceFactory"
+              uniqueResourceName="process-engine"
+              driverClassName="oracle.jdbc.OracleDriver"
+              url="jdbc:oracle:thin:@//192.168.1.127:1521/XEPDB1"
+              username="CAMUNDA"
+              password="admin123"
+              defaultTransactionIsolation="READ_COMMITTED"
+              maxActive="20"
+              minIdle="5"
+              maxIdle="20"
+              testOnBorrow="true"
+              validationQuery="SELECT 1 FROM DUAL" />
+  </GlobalNamingResources>
+
+  <Service name="Catalina">
+    <Connector port="8080" protocol="HTTP/1.1"
+               connectionTimeout="20000"
+               redirectPort="8443"
+               maxThreads="200" />
+
+    <Engine name="Catalina" defaultHost="localhost">
+      <Realm className="org.apache.catalina.realm.LockOutRealm">
+        <Realm className="org.apache.catalina.realm.UserDatabaseRealm"
+               resourceName="UserDatabase"/>
+      </Realm>
+
+      <Host name="localhost" appBase="webapps"
+            unpackWARs="true" autoDeploy="true">
+        <!-- Để Tomcat tự động deploy các folder trong webapps (ROOT, camunda, engine-rest...) -->
+        <Valve className="org.apache.catalina.valves.AccessLogValve" directory="logs"
+               prefix="localhost_access_log" suffix=".txt"
+               pattern="%h %l %u %t &quot;%r&quot; %s %b" />
+      </Host>
+    </Engine>
+  </Service>
+</Server>
+```
+
+> **CẢNH BÁO:** Thay `password="admin123"` bằng mật khẩu thật của Oracle user `CAMUNDA` nếu khác.
+
+---
+
+## 5. Tạo Dockerfile và build custom image (Giải thích chi tiết)
+
+### Tại sao bước này lại cần thiết?
+Mặc định, bản cài đặt chính thức (official image) `camunda/camunda-bpm-platform:tomcat-7.24.0` do Camunda phát hành được tối ưu dung lượng nên chỉ đi kèm sẵn driver kết nối cho các database mã nguồn mở phổ biến như H2, MySQL và PostgreSQL. Bản image này **hoàn toàn không có driver kết nối cơ sở dữ liệu Oracle (`ojdbc11.jar`)**.
+
+Nếu bạn dùng thẳng image gốc này để kết nối với cơ sở dữ liệu Oracle của bạn tại `192.168.1.127:1521/XEPDB1`, máy chủ Tomcat bên trong container sẽ khởi động thất bại ngay lập tức và báo lỗi: `java.lang.ClassNotFoundException: oracle.jdbc.OracleDriver`.
+
+Để khắc phục, chúng ta cần tạo một Docker image tùy biến (custom image) thừa hưởng từ image gốc của Camunda, sau đó thêm driver Oracle vào thư viện của Tomcat.
+
+---
+
+### 5.1 Tạo file Dockerfile định nghĩa cấu trúc Image mới
+
+Tạo một file văn bản có tên chính xác là `Dockerfile` tại thư mục `/opt/camunda-docker`:
+
+```bash
+sudo vim /opt/camunda-docker/Dockerfile
+```
+
+Dán toàn bộ nội dung cấu hình sau vào file:
+
+```dockerfile
+# Sử dụng base image chính thức của Camunda phiên bản 7.24.0 chạy trên Tomcat
+FROM camunda/camunda-bpm-platform:tomcat-7.24.0
+
+# Copy file Oracle JDBC driver (chúng ta đã tải về thư mục driver/ ở Bước 3)
+# vào thư mục /camunda/lib (đường dẫn lưu trữ thư viện dùng chung của Tomcat trong container)
+COPY driver/ojdbc11.jar /camunda/lib/ojdbc11.jar
+```
+
+**Giải thích ý nghĩa các dòng trong Dockerfile:**
+* `FROM camunda/camunda-bpm-platform:tomcat-7.24.0`: Khai báo Docker sử dụng image gốc này làm nền tảng.
+* `COPY driver/ojdbc11.jar /camunda/lib/ojdbc11.jar`: Sao chép driver Oracle từ thư mục local của bạn trên server vào thư mục chứa thư viện (`lib`) của máy chủ Tomcat trong container. Nhờ đó, khi Tomcat khởi động, nó có thể tự nhận diện được driver của Oracle.
+
+---
+
+### 5.2 Thực hiện Build ra Docker Image tùy chỉnh
+
+Di chuyển vào đúng thư mục gốc của project (nơi chứa Dockerfile vừa tạo) và thực hiện lệnh build:
+
+```bash
+cd /opt/camunda-docker
+docker build -t camunda-oracle:7.24.0 .
+```
+
+* **Ý nghĩa tham số `-t camunda-oracle:7.24.0`**: Đặt tên (tag) cho image tùy chỉnh của chúng ta là `camunda-oracle` với phiên bản `7.24.0`.
+* **Ý nghĩa dấu chấm `.` cuối lệnh**: Chỉ định ngữ cảnh build (build context) là thư mục hiện hành `/opt/camunda-docker`. Docker sẽ tìm file có tên `Dockerfile` trong thư mục này để thực thi.
+
+Sau khi quá trình build kết thúc thành công, hãy chạy lệnh sau để kiểm tra xem image mới đã được lưu vào Docker của máy chưa:
+
+```bash
+docker images | grep camunda-oracle
+```
+
+Nếu màn hình hiển thị dòng `camunda-oracle  7.24.0 ...` tức là bạn đã đóng gói thành công driver Oracle vào image và có thể sử dụng image này ở bước Docker Compose tiếp theo.
+
+Kiểm tra:
+
+```bash
+docker images | grep camunda-oracle
+```
+
+---
+
+## 6. Tạo Docker Compose và khởi động 2 container
+
+### 6.1 Tạo file docker-compose.yml
+
+```bash
+sudo vim /opt/camunda-docker/docker-compose.yml
+```
+
+```yaml
+services:
+  camunda1:
+    image: camunda-oracle:7.24.0
+    container_name: camunda1
+    restart: unless-stopped
+    ports:
+      - "8081:8080"
+    environment:
+      - SKIP_DB_CONFIG=true
+      - WAIT_FOR=192.168.1.127:1521
+      - WAIT_FOR_TIMEOUT=60
+      - JAVA_OPTS=-Xms1g -Xmx2g -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Djava.awt.headless=true
+    volumes:
+      - ./config/server.xml:/camunda/conf/server.xml:ro
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+          cpus: "2.0"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/camunda/api/engine/engine || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+
+  camunda2:
+    image: camunda-oracle:7.24.0
+    container_name: camunda2
+    restart: unless-stopped
+    ports:
+      - "8082:8080"
+    environment:
+      - SKIP_DB_CONFIG=true
+      - WAIT_FOR=192.168.1.127:1521
+      - WAIT_FOR_TIMEOUT=60
+      - JAVA_OPTS=-Xms1g -Xmx2g -XX:+UseG1GC -XX:MaxGCPauseMillis=200 -Djava.awt.headless=true
+    volumes:
+      - ./config/server.xml:/camunda/conf/server.xml:ro
+    deploy:
+      resources:
+        limits:
+          memory: 3g
+          cpus: "2.0"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/camunda/api/engine/engine || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "50m"
+        max-file: "5"
+```
+
+### Giải thích các tham số quan trọng
+
+```text
+SKIP_DB_CONFIG=true     → Không để entrypoint script ghi đè cấu hình DB (ta dùng server.xml custom)
+WAIT_FOR=...            → Container đợi Oracle DB sẵn sàng trước khi start Tomcat
+JAVA_OPTS               → JVM tuning: heap 1-2GB, G1GC, max pause 200ms
+memory: 3g              → Container limit = Xmx (2g) × 1.5 → headroom cho JVM non-heap
+restart: unless-stopped → Tự restart sau reboot (khi Docker service đã enable)
+healthcheck             → Docker tự kiểm tra Camunda có respond không, mỗi 30 giây
+```
+
+> **Lưu ý RAM:** Server B cần tối thiểu **8GB RAM** (3g × 2 container + OS overhead).
+> Nếu server chỉ có 4GB RAM, giảm xuống:
+> ```yaml
+> JAVA_OPTS: -Xms512m -Xmx1g ...
+> limits:
+>   memory: 1536m
+> ```
+
+### 6.2 Khởi động
+
+```bash
+cd /opt/camunda-docker
+docker compose up -d
+```
+
+### 6.3 Kiểm tra
+
+```bash
+# Trạng thái container
+docker compose ps
+
+# Log khởi động (đợi ~30-60 giây)
+docker compose logs -f
+
+# Khi log hiện "Server startup in ..." thì đã sẵn sàng. Ctrl+C để thoát log.
+
+# Health check
+docker inspect --format='{{.State.Health.Status}}' camunda1
+docker inspect --format='{{.State.Health.Status}}' camunda2
+# Kỳ vọng: healthy (có thể mất 1-2 phút sau khi start)
+
+# Test API từng container
+curl -I http://localhost:8081/camunda
+curl -I http://localhost:8082/camunda
+curl http://localhost:8081/engine-rest/engine
+curl http://localhost:8082/engine-rest/engine
+# Kỳ vọng: HTTP 200, response JSON [{"name":"default"}]
+```
+
+---
+
+## 7. Mở Firewall trên Server B
+
+Mở port 8081 và 8082 để Server A (Nginx) kết nối được:
+
+```bash
+sudo systemctl enable --now firewalld
+
+# Cách 1: Mở cho tất cả (đơn giản)
+sudo firewall-cmd --add-port=8081/tcp --permanent
+sudo firewall-cmd --add-port=8082/tcp --permanent
+sudo firewall-cmd --reload
+```
+
+Nếu muốn strict hơn — chỉ cho phép IP của Server A:
+
+```bash
+# Cách 2: Chỉ cho IP Server A kết nối (thay <IP_SERVER_A> bằng IP thực tế)
+sudo firewall-cmd --add-rich-rule='rule family="ipv4" source address="<IP_SERVER_A>" port port="8081" protocol="tcp" accept' --permanent
+sudo firewall-cmd --add-rich-rule='rule family="ipv4" source address="<IP_SERVER_A>" port port="8082" protocol="tcp" accept' --permanent
+sudo firewall-cmd --reload
+```
+
+Kiểm tra:
+
+```bash
+sudo firewall-cmd --list-all
+```
+
+---
+
+## 8. Đặt timezone (nếu chưa set)
+
+```bash
+sudo timedatectl set-timezone Asia/Ho_Chi_Minh
+timedatectl
+```
+
+---
+
+# PHẦN II — SERVER A: Nginx Load Balancer
+
+> ⚠️ Thực hiện toàn bộ phần này trên **Server A**.
+
+---
+
+## 9. Cài đặt Nginx
+
+```bash
+sudo dnf update -y
+sudo dnf install -y nginx curl policycoreutils-python-utils
+sudo systemctl enable nginx
+```
+
+---
+
+## 10. Cấu hình Nginx upstream load balancer
+
+### 10.1 Tạo file cấu hình
+
+```bash
+sudo vim /etc/nginx/conf.d/camunda-lb.conf
+```
+
+Nội dung (thay `<IP_SERVER_B>` bằng IP thực tế của Server B):
+
+```nginx
+upstream camunda_cluster {
+    # Sticky session: cùng 1 IP client luôn đến cùng 1 backend node
+    # Bắt buộc cho Camunda Webapps (Cockpit, Tasklist, Admin) vì dùng cookie auth
+    ip_hash;
+
+    server <IP_SERVER_B>:8081;   # Camunda container 1
+    server <IP_SERVER_B>:8082;   # Camunda container 2
+}
+
+server {
+    listen 7777;
+    server_name _;
+
+    client_max_body_size 50m;
+
+    # Nginx status page (chỉ truy cập local)
+    location /nginx-status {
+        stub_status on;
+        allow 127.0.0.1;
+        deny all;
+    }
+
+    location / {
+        proxy_pass http://camunda_cluster;
+
+        proxy_http_version 1.1;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto $scheme;
+
+        # Timeout cho các process/task nặng
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 300s;
+        proxy_read_timeout 300s;
+
+        # Tự động failover: nếu 1 backend lỗi, chuyển sang backend còn lại
+        proxy_next_upstream error timeout http_502 http_503 http_504;
+        proxy_next_upstream_tries 2;
+    }
+}
+```
+
+### 10.2 Giải thích chi tiết cấu hình Nginx
+
+```text
+upstream camunda_cluster {...}
+  → Định nghĩa một cụm (nhóm) các máy chủ backend để Nginx cân bằng tải. Ở đây ta đặt tên cụm này là "camunda_cluster"
+  và khai báo 2 server là "camunda1" (:8081) và "camunda2" (:8082) trên Server B.
+
+proxy_pass http://camunda_cluster;
+  → Đây là câu lệnh chuyển tiếp (proxy) chính. Khi có bất kỳ request nào của client gửi đến cổng 7777 của Nginx,
+  lệnh này chỉ thị cho Nginx: "Hãy chuyển tiếp toàn bộ request này đến cụm camunda_cluster đã khai báo ở trên".
+  Nginx sẽ đóng vai trò trung gian đứng ra kết nối, lấy nội dung từ 1 trong 2 container Camunda, rồi trả lại cho client.
+
+ip_hash;
+  → Thuật toán cân bằng tải "Sticky Session" dựa trên địa chỉ IP của Client. Nginx sẽ băm (hash) IP của client
+  và luôn luôn định tuyến một client có cùng địa chỉ IP truy cập vào cố định một container Camunda (ví dụ: camunda1).
+  Điều này cực kỳ bắt buộc đối với ứng dụng Camunda Webapps (Cockpit, Tasklist, Admin) vì chúng sử dụng Session trong bộ nhớ
+  để xác thực (Cookie Auth). Nếu không có "ip_hash", mỗi lần click chuột Nginx sẽ nhảy sang container khác, khiến client liên tục bị đẩy ra màn hình đăng nhập.
+
+proxy_next_upstream error timeout http_502 http_503 http_504;
+  → Tính năng tự động chịu lỗi (failover tự động). Nếu Nginx chuyển tiếp request đến một node (ví dụ: camunda1) mà node đó bị lỗi
+  (như sập nguồn, lỗi 502/503/504 hoặc phản hồi quá lâu), Nginx sẽ tự động chuyển request đó sang node còn lại (camunda2)
+  ngay lập tức mà client không hề biết hay gặp lỗi.
+
+proxy_read_timeout 300s
+  → Thời gian Nginx đợi phản hồi từ container Camunda. Camunda thường xử lý các nghiệp vụ, tiến trình nặng (như chạy các task Java),
+  nên cần thiết lập thời gian chờ đủ dài (300 giây) để tránh việc Nginx tự động ngắt kết nối giữa chừng và trả về lỗi 504 Gateway Timeout.
+```
+
+---
+
+## 11. Cấu hình SELinux và Firewall trên Server A
+
+### 11.1 SELinux
+
+```bash
+# Cho phép Nginx bind vào port 7777 (port ngoài danh sách mặc định)
+sudo semanage port -a -t http_port_t -p tcp 7777 2>/dev/null || \
+  sudo semanage port -m -t http_port_t -p tcp 7777
+
+# Cho phép Nginx kết nối đến backend qua mạng — RẤT QUAN TRỌNG!
+sudo setsebool -P httpd_can_network_connect on
+```
+
+> **⚠️ CẢNH BÁO:** Nếu quên lệnh `setsebool -P httpd_can_network_connect on`, Nginx sẽ trả 502 Bad Gateway mặc dù backend đang chạy bình thường. Đây là nguyên nhân #1 gây lỗi trên Rocky Linux 9.
+
+### 11.2 Test cấu hình Nginx
+
+```bash
+sudo nginx -t
+# Kỳ vọng: syntax is ok, test is successful
+```
+
+### 11.3 Start Nginx
+
+```bash
+sudo systemctl start nginx
+sudo systemctl status nginx
+```
+
+### 11.4 Firewall
+
+```bash
+sudo systemctl enable --now firewalld
+
+# Mở port 7777 cho client truy cập
+sudo firewall-cmd --add-port=7777/tcp --permanent
+sudo firewall-cmd --reload
+
+# Kiểm tra
+sudo firewall-cmd --list-all
+```
+
+---
+
+## 12. Đặt timezone (nếu chưa set)
+
+```bash
+sudo timedatectl set-timezone Asia/Ho_Chi_Minh
+timedatectl
+```
+
+---
+
+# PHẦN III — KIỂM TRA TOÀN BỘ HỆ THỐNG
+
+---
+
+## 13. Test kết nối end-to-end
+
+### 13.1 Từ Server A — test kết nối đến Server B
+
+```bash
+# Trực tiếp đến từng Camunda container
+curl -I http://<IP_SERVER_B>:8081/camunda
+curl -I http://<IP_SERVER_B>:8082/camunda
+
+# Kỳ vọng: HTTP 302 hoặc HTTP 200
+```
+
+### 13.2 Từ Server A — test qua Nginx load balancer
+
+```bash
+curl -I http://localhost:7777/camunda
+curl http://localhost:7777/engine-rest/engine
+
+# Kỳ vọng: HTTP 200, response [{"name":"default"}]
+```
+
+### 13.3 Từ máy client (browser)
+
+```text
+http://<IP_SERVER_A>:7777/camunda
+```
+
+Đăng nhập Cockpit / Tasklist / Admin. Kiểm tra hoạt động bình thường.
+
+---
+
+## 14. Test Failover
+
+### 14.1 Dừng 1 node
+
+Trên **Server B**:
+
+```bash
+docker stop camunda1
+```
+
+### 14.2 Kiểm tra vẫn truy cập được
+
+Trên **Server A** hoặc từ browser:
+
+```bash
+curl -I http://localhost:7777/camunda
+# → Vẫn HTTP 200, request tự chuyển sang camunda2
+```
+
+Browser: refresh trang → vẫn dùng được bình thường qua node còn lại.
+
+### 14.3 Khôi phục
+
+Trên **Server B**:
+
+```bash
+docker start camunda1
+
+# Đợi healthy
+docker inspect --format='{{.State.Health.Status}}' camunda1
+# Kỳ vọng: healthy (sau ~1-2 phút)
+```
+
+---
+
+## 15. Test Reboot cả 2 server
+
+### 15.1 Reboot Server B trước
+
+```bash
+sudo reboot
+```
+
+Sau khi server lên:
+
+```bash
+docker compose -f /opt/camunda-docker/docker-compose.yml ps
+# Kỳ vọng: cả 2 container đang running
+
+docker inspect --format='{{.State.Health.Status}}' camunda1
+docker inspect --format='{{.State.Health.Status}}' camunda2
+```
+
+### 15.2 Reboot Server A
+
+```bash
+sudo reboot
+```
+
+Sau khi server lên:
+
+```bash
+sudo systemctl status nginx
+curl -I http://localhost:7777/camunda
+# Kỳ vọng: HTTP 200
+```
+
+---
+
+# PHẦN IV — VẬN HÀNH
+
+---
+
+## 16. Các lệnh thường dùng
+
+### Trên Server B (Camunda Docker)
+
+```bash
+# Khởi động cả 2 container
+cd /opt/camunda-docker && docker compose up -d
+
+# Dừng cả 2
+cd /opt/camunda-docker && docker compose down
+
+# Rolling restart (không downtime)
+docker restart camunda1
+sleep 30    # Đợi node 1 healthy trước
+docker restart camunda2
+
+# Xem log realtime
+docker compose -f /opt/camunda-docker/docker-compose.yml logs -f
+
+# Log 1 container
+docker logs camunda1 --tail 200 -f
+docker logs camunda2 --tail 200 -f
+
+# Xem tài nguyên (CPU, Memory, Network)
+docker stats camunda1 camunda2
+
+# Thread dump (debug performance)
+docker exec camunda1 jstack 1
+
+# Heap dump (debug memory)
+docker exec camunda1 jmap -dump:format=b,file=/tmp/heap.hprof 1
+docker cp camunda1:/tmp/heap.hprof /tmp/camunda1-heap.hprof
+```
+
+### Trên Server A (Nginx)
+
+```bash
+# Reload cấu hình (không downtime)
+sudo nginx -t && sudo nginx -s reload
+
+# Restart
+sudo systemctl restart nginx
+
+# Log
+sudo tail -f /var/log/nginx/access.log
+sudo tail -f /var/log/nginx/error.log
+
+# Nginx status
+curl http://localhost/nginx-status
+```
+
+---
+
+## 17. Cập nhật Camunda version
+
+Khi cần nâng version Camunda (ví dụ 7.24.0 → 7.24.1):
+
+```bash
+cd /opt/camunda-docker
+
+# 1. Sửa Dockerfile: đổi FROM tag
+sudo vim Dockerfile
+# FROM camunda/camunda-bpm-platform:tomcat-7.24.1
+
+# 2. Build lại image
+docker build -t camunda-oracle:7.24.1 .
+
+# 3. Sửa docker-compose.yml: đổi image tag
+sudo vim docker-compose.yml
+# image: camunda-oracle:7.24.1
+
+# 4. Rolling update
+docker compose up -d --no-deps camunda1
+sleep 60   # Đợi node 1 healthy
+docker compose up -d --no-deps camunda2
+```
+
+---
+
+## 18. Giám sát cơ bản
+
+### Health check script (đặt trên Server A)
+
+```bash
+sudo vim /opt/camunda-healthcheck.sh
+```
+
+```bash
+#!/bin/bash
+# Kiểm tra cả 2 node Camunda qua Nginx
+
+NGINX_URL="http://localhost:7777/engine-rest/engine"
+NODE1_URL="http://<IP_SERVER_B>:8081/engine-rest/engine"
+NODE2_URL="http://<IP_SERVER_B>:8082/engine-rest/engine"
+
+check_url() {
+    local name=$1
+    local url=$2
+    if curl -sf --max-time 5 "$url" | grep -q "default"; then
+        echo "[OK] $name"
+    else
+        echo "[FAIL] $name - $url"
+    fi
+}
+
+echo "=== Camunda Health Check: $(date) ==="
+check_url "Nginx LB" "$NGINX_URL"
+check_url "Camunda1" "$NODE1_URL"
+check_url "Camunda2" "$NODE2_URL"
+echo ""
+```
+
+```bash
+sudo chmod +x /opt/camunda-healthcheck.sh
+
+# Chạy thủ công
+/opt/camunda-healthcheck.sh
+
+# Hoặc cron mỗi 5 phút
+sudo crontab -e
+# Thêm dòng:
+# */5 * * * * /opt/camunda-healthcheck.sh >> /var/log/camunda-health.log 2>&1
+```
+
+---
+
+## 19. Tóm tắt thứ tự triển khai
+
+| Bước | Server | Nội dung | Thời gian |
+|------|--------|----------|-----------|
+| 1 | B | Cài Docker CE | 5 phút |
+| 2-3 | B | Tạo project, tải Oracle JDBC driver | 5 phút |
+| 4 | B | Tạo `server.xml` cấu hình Oracle | 5 phút |
+| 5 | B | Tạo Dockerfile, build custom image | 5 phút |
+| 6 | B | Tạo `docker-compose.yml`, khởi động 2 container | 5 phút |
+| 7-8 | B | Mở firewall, set timezone | 3 phút |
+| 9 | A | Cài Nginx | 3 phút |
+| 10 | A | Cấu hình Nginx upstream load balancer | 5 phút |
+| 11-12 | A | SELinux, firewall, timezone | 5 phút |
+| 13-15 | A+B | Test end-to-end, failover, reboot | 15 phút |
+| **Tổng** | | | **~55 phút** |
+
+---
+
+## 20. So sánh với cài bare metal
+
+| Khía cạnh | Bare metal (tài liệu cũ) | Docker (tài liệu này) |
+|-----------|-------------------------|----------------------|
+| Cài đặt | Tải tar.gz, giải nén, tạo systemd service | Build Docker image, docker compose up |
+| Cấu hình | Sửa trực tiếp file trong `/opt/camunda` | Mount file config, thay đổi không ảnh hưởng image |
+| Scale | Cài thêm 1 server hoàn chỉnh | `docker compose up -d --scale` hoặc thêm service |
+| Rollback | Backup thủ công, restore phức tạp | Đổi image tag, `docker compose up -d` |
+| Isolation | Chia sẻ OS, có thể xung đột | Container cô lập hoàn toàn |
+| Log | `tail -f catalina.out` | `docker logs -f` |
+| Update | Dừng service, thay file, start lại | Build image mới, rolling update |
+| Restart | systemd service | `restart: unless-stopped` |
+| Resource limit | Giới hạn bằng cgroup thủ công | `mem_limit`, `cpus` trong compose |
+| Debug | `jstack <pid>`, `jmap` trực tiếp | `docker exec` rồi `jstack 1` |
+
+---
+
+## 21. Troubleshooting
+
+### Lỗi 502 Bad Gateway trên Nginx
+
+```text
+Nguyên nhân 1: SELinux chặn kết nối outbound
+→ sudo setsebool -P httpd_can_network_connect on
+
+Nguyên nhân 2: Firewall Server B chưa mở port
+→ sudo firewall-cmd --list-all  (trên Server B)
+
+Nguyên nhân 3: Container chưa healthy
+→ docker inspect --format='{{.State.Health.Status}}' camunda1
+
+Nguyên nhân 4: Oracle DB không kết nối được từ container
+→ docker exec camunda1 curl -v telnet://192.168.1.127:1521
+→ docker logs camunda1 | grep -i "oracle\|error\|exception"
+```
+
+### Container restart liên tục (CrashLoopBackOff)
+
+```text
+→ docker logs camunda1 --tail 50
+Thường do:
+1. Oracle DB chưa tạo user CAMUNDA / chưa cấp quyền
+2. server.xml bị lỗi cú pháp XML (ký tự < > trong giá trị)
+3. ojdbc11.jar không đúng version hoặc bị corrupt
+4. Hết memory (kiểm tra docker stats)
+```
+
+### Camunda tự thoát sau vài phút
+
+```text
+→ docker stats camunda1 camunda2
+Nếu MEM USAGE gần bằng LIMIT → OOM Killer
+→ Tăng mem_limit trong docker-compose.yml
+→ Hoặc giảm -Xmx trong JAVA_OPTS
+Nguyên tắc: mem_limit >= Xmx × 1.5
+```
+
+### Chậm khi nhiều user truy cập
+
+```text
+1. Kiểm tra Oracle DB: session count, slow query
+2. docker stats → kiểm tra CPU/Memory
+3. Tăng maxActive trong server.xml (connection pool)
+4. Tăng maxThreads trong Connector (mặc định 200)
+5. Cân nhắc tăng -Xmx nếu GC quá nhiều
+```
