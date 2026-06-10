@@ -62,11 +62,13 @@ bash
 # Tạo thư mục chứa code tại /opt (cần quyền sudo)
 sudo mkdir -p /opt/coopbank
 sudo chown -R $(whoami):$(whoami) /opt/coopbank
+sudo mkdir -p /opt/coopbank/source
+sudo chown -R $(whoami):$(whoami) /opt/coopbank/source
 # Clone source code (thay <YOUR_PAT> bằng Azure DevOps PAT thực tế)
 # Format: https://pat:<YOUR_PAT>@dev.azure.com/...
 git clone https://pat:<YOUR_PAT>@dev.azure.com/istscompany/LOS%20Application%202x/_git/LOS2X /opt/coopbank
 # Chuyển sang branch cần deploy
-cd /opt/coopbank
+cd /opt/coopbank/source
 git checkout testing
 NOTE
 
@@ -120,7 +122,7 @@ yaml
 services:
   coopbank-website:
     build:
-      context: ../
+      context: ../source
       dockerfile: ISTS.Website/Dockerfile
       secrets:
         - azdo_pat
@@ -142,7 +144,7 @@ services:
       - coopbank-network
   coopbank-api:
     build:
-      context: ../
+      context: ../source
       dockerfile: ISTS.Inbound.MyBank/Dockerfile
       secrets:
         - azdo_pat
