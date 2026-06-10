@@ -432,6 +432,9 @@ sudo docker compose build
 sudo docker compose up -d
 TIP
 
+# Dọn rác 
+docker system prune
+
 Nếu chỉ thay đổi biến môi trường trong docker-compose.yml (không đổi code), chỉ cần chạy sudo docker compose up -d mà KHÔNG cần build lại.
 
 C2. Lệnh Docker hữu ích
